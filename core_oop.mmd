@@ -1,0 +1,76 @@
+classDiagram
+    direction TB
+
+    class std {
+        +Postman api
+        +BarScanner barscanner
+        +PipeFallIO pipefall
+        +IBinder systemIO
+        +UIfurge uifurge
+        +onCreate() std
+        +run() std
+    }
+
+    class Postman {
+        +NetTarget target
+        +get()
+        +post()
+    }
+
+    class NetTarget {
+        +scheme
+        +host
+        +port
+        +path
+    }
+
+    class PostmanAction {
+        +ok
+        +done
+        +msg
+        +Do()
+    }
+
+    class BarScanner {
+        +start()
+        +stop()
+        +destroy()
+    }
+
+    class NewBarScanner {
+        +invoke() BarScanner
+    }
+
+    class UIfurge {
+        +bindUI()
+        +render()
+    }
+
+    class PipeFallIO {
+        <<abstract>>
+        +writeEvent()
+        +writeCommand()
+    }
+
+    class PipeFall {
+        +writeEvent()
+        +writeCommand()
+    }
+
+    class IBinder {
+        <<system>>
+    }
+
+    std *-- Postman : 封装 api
+    std *-- BarScanner : 封装 scanner
+    std *-- UIfurge : 封装 ui
+    std *-- PipeFallIO : 封装 pipe
+    std o-- IBinder : systemIO
+
+    Postman *-- NetTarget : 封装目标地址
+    Postman ..> PostmanAction : 创建一次性动作
+
+    NewBarScanner ..> BarScanner : 工厂创建
+
+    PipeFall --|> PipeFallIO : 实现抽象
+    PipeFallIO --|> IBinder : 可上转型

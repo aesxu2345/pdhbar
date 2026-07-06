@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">浦医早餐权益审核</string>
+    <string name="scanner_library">Scanner library</string>
+    <string name="scanning_with">Scanning with</string>
+    <string name="turn_flash_on_off">Turn flash on or off</string>
+    <string name="result">Result</string>
+    <string name="copy">Copy</string>
+</resources>

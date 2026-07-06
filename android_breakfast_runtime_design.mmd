@@ -1,0 +1,219 @@
+flowchart TD
+    %% Android 早餐核销 App Runtime / OOP 草稿总览
+    %% 目标：把复杂 OOP 设计压成一张可读图
+    %% 约束：只改对象签名，不随意改主架构
+
+    %% =========================
+    %% 1. 生命周期入口
+    %% =========================
+    subgraph LIFECYCLE["Android 生命周期窗口"]
+        APP_ONCREATE["Application.onCreate\n可初始化基础环境"]
+        ACT_ONCREATE["Activity.onCreate\n装配窗口"]
+        ACT_ONSTART["Activity.onStart\nUI attach"]
+        ACT_ONRESUME["Activity.onResume\n运行窗口"]
+        ACT_ONPAUSE["Activity.onPause\n暂停窗口"]
+        ACT_ONSTOP["Activity.onStop\nflush 可恢复状态"]
+        ACT_ONDESTROY["Activity.onDestroy\n释放 UI / 扫码句柄"]
+
+        APP_ONCREATE --> ACT_ONCREATE
+        ACT_ONCREATE --> ACT_ONSTART
+        ACT_ONSTART --> ACT_ONRESUME
+        ACT_ONRESUME --> ACT_ONPAUSE
+        ACT_ONPAUSE --> ACT_ONSTOP
+        ACT_ONSTOP --> ACT_ONDESTROY
+    end
+
+    %% =========================
+    %% 2. std 顶层缓冲区
+    %% =========================
+    subgraph STD["std：App 进程级顶层缓冲区"]
+        STD_API["std.run().api: Postman\n长活 HTTP 工厂"]
+        STD_SCANNER["std.run().barscanner: BarScanner\n长活扫码对象"]
+        STD_PIPE["std.run().pipefall: PipeFallIO\n事件管道接口"]
+        STD_BINDER["std.run().systemIO: IBinder\n系统通信锚点"]
+        STD_UIFURGE["std.run().uifurge: UIfurge\nUI 事件管理器"]
+    end
+
+    ACT_ONCREATE -->|"创建 PipeFall"| STD_PIPE
+    ACT_ONCREATE -->|"OnBindSystemIO(pipefall)"| STD_BINDER
+    ACT_ONCREATE -->|"创建 Postman(NetTarget)"| STD_API
+    ACT_ONCREATE -->|"创建 NewBarScanner(api, pipefall)"| STD_SCANNER
+    ACT_ONCREATE -->|"创建 UIfurge(pipefall)"| STD_UIFURGE
+
+    ACT_ONSTART -->|"绑定当前 UI，不长持 Activity"| STD_UIFURGE
+    ACT_ONRESUME -->|"start()"| STD_SCANNER
+    ACT_ONPAUSE -->|"stop()"| STD_SCANNER
+    ACT_ONSTOP -->|"flush pending / 状态"| STD_PIPE
+    ACT_ONDESTROY -->|"destroy()，不做业务兜底"| STD_SCANNER
+
+    %% =========================
+    %% 3. Postman / NetTarget / Action
+    %% =========================
+    subgraph HTTP["Postman HTTP 接口模型"]
+        NETTARGET["NetTarget\nscheme\nhost\nport\npath\nheaders\ntimeout\nretry\nterminalId\noperatorId"]
+
+        POSTMAN["Postman(target: NetTarget)\n只做请求工厂\n不保存临时 execute"]
+
+        GET["get(xwww)\nGET + query/x-www-form-urlencoded"]
+        POST["post(json)\nPOST + JSON body"]
+
+        ACTION["PostmanAction\n短活一次性请求对象\n公开成员：ok / done / msg"]
+
+        DO["Do(): PostmanAction\n执行一次\n写入 action.ok\n返回 action 自身"]
+
+        GC["局部作用域结束\n无 std/global 引用\n等待 GC"]
+    end
+
+    STD_API --> POSTMAN
+    POSTMAN --> NETTARGET
+    POSTMAN --> GET
+    POSTMAN --> POST
+    GET --> ACTION
+    POST --> ACTION
+    ACTION --> DO
+    DO -->|"上层读取 action.ok"| GC
+
+    %% 早餐接口示例
+    subgraph BREAKFAST_API["当前早餐核销接口"]
+        API_URL["GET http://172.16.203.56:8088/change_breakfast_status"]
+        API_PARAMS["参数\norder_code 必填\nbreakfast_status: 1登记 / 0取消\nbreakfast_remark 可选"]
+        API_RESULT["返回\ncode=200 成功\ncode=400 错误\nmsg 错误信息"]
+    end
+
+    NETTARGET -.-> API_URL
+    GET -.-> API_PARAMS
+    DO -.-> API_RESULT
+
+    %% =========================
+    %% 4. PipeFall / IBinder
+    %% =========================
+    subgraph PIPE["PipeFall / Binder 通信模型"]
+        PIPEFALL_IO["abstract class PipeFallIO : Binder()\nwriteEvent(UiEvent)\nwriteCommand(UiCommand)"]
+        PIPEFALL["PipeFall : PipeFallIO\n事件管道实现"]
+        ONBIND["OnBindSystemIO(pipefall: PipeFallIO): IBinder\nreturn pipefall"]
+        IBINDER["IBinder 锚点\n只锚定 PipeFallIO\n不锚定每个事件"]
+    end
+
+    STD_PIPE --> PIPEFALL_IO
+    PIPEFALL --> PIPEFALL_IO
+    STD_PIPE --> ONBIND
+    ONBIND --> STD_BINDER
+    ONBIND --> IBINDER
+
+    %% PipeFallIO 的对象签名预留
+    subgraph FUTURE_BINDER["仅允许小改：PipeFallIO 对象签名替换"]
+        BINDER_NOW["当前：PipeFallIO : Binder()"]
+        AIDL["可替换：AIDL Stub\n跨进程"]
+        MESSENGER["可替换：Messenger\nHandler 消息管道"]
+        RESULT_RECEIVER["可内置：ResultReceiver\n更适合作回调 socket"]
+    end
+
+    PIPEFALL_IO -.-> BINDER_NOW
+    BINDER_NOW -.-> AIDL
+    BINDER_NOW -.-> MESSENGER
+    BINDER_NOW -.-> RESULT_RECEIVER
+
+    %% =========================
+    %% 5. UI / Worker 异步流
+    %% =========================
+    subgraph UI_THREAD["UI Thread"]
+        UI["Activity / Dialog / Button / Toast"]
+        UIF["UIfurge\n接收 UI 输入\n渲染 UiCommand"]
+    end
+
+    subgraph WORKER_THREAD["Worker Thread"]
+        WORKER["业务 Worker\n处理扫码/核销/查询"]
+        LOCAL_CACHE["本地状态 / pending 队列\n失败重试 / 落库"]
+    end
+
+    subgraph EVENTS["事件与命令"]
+        UIEVENT["UiEvent\nScanCode\nBreakfastDone\nBreakfastCancel\nDialogCancel"]
+        UICOMMAND["UiCommand\nShowCustomer\nToast\nCloseDialog"]
+    end
+
+    UI -->|"点击完成/取消"| UIF
+    STD_SCANNER -->|"扫码输入"| UIEVENT
+    UIF -->|"writeEvent(event)"| STD_PIPE
+    STD_PIPE --> UIEVENT
+    UIEVENT -->|"异步消费"| WORKER
+
+    WORKER -->|"std.api.get(...).Do()"| ACTION
+    DO -->|"action.ok == true/false"| WORKER
+    WORKER -->|"成功：写本地状态"| LOCAL_CACHE
+    WORKER -->|"失败：进入 pending"| LOCAL_CACHE
+
+    WORKER -->|"writeCommand(command)"| STD_PIPE
+    STD_PIPE --> UICOMMAND
+    UICOMMAND -->|"必须切回主线程"| UIF
+    UIF -->|"render()"| UI
+
+    %% =========================
+    %% 6. BarScanner
+    %% =========================
+    subgraph SCANNER["BarScanner"]
+        BS_START["start()\nActivity.onResume"]
+        BS_STOP["stop()\nActivity.onPause"]
+        BS_DESTROY["destroy()\nActivity.onDestroy"]
+        BS_ONSCAN["onScan(orderCode)\n只投递 UiEvent.ScanCode\n不直接操作 UI"]
+    end
+
+    STD_SCANNER --> BS_START
+    STD_SCANNER --> BS_STOP
+    STD_SCANNER --> BS_DESTROY
+    STD_SCANNER --> BS_ONSCAN
+    BS_ONSCAN --> UIEVENT
+
+    %% =========================
+    %% 7. 关键约束
+    %% =========================
+    subgraph RULES["硬约束 / 防迷路规则"]
+        R1["std 长活\nAction / UiEvent / UiCommand 短活"]
+        R2["Postman 不保存临时 execute\nget/post 生成一次性 PostmanAction"]
+        R3["Do() 执行后写 action.ok\n上层读 action.ok\n不要改回临时 Boolean"]
+        R4["IBinder 只锚定 PipeFallIO\n不要让每个事件都变成 IBinder"]
+        R5["UI 线程不跑 HTTP\nWorker 不直接操作 View/Dialog/Toast"]
+        R6["onDestroy 不做业务兜底\n核心状态及时落库或进 pending"]
+        R7["只允许小改对象签名\n不要拆 std / Postman / UIfurge / PipeFall 主线"]
+    end
+
+    STD --> R1
+    POSTMAN --> R2
+    ACTION --> R3
+    IBINDER --> R4
+    UI_THREAD --> R5
+    WORKER_THREAD --> R5
+    ACT_ONDESTROY --> R6
+    STD --> R7
+
+    %% =========================
+    %% 8. 典型业务链路
+    %% =========================
+    subgraph FLOW_DONE["典型链路：点击完成早餐"]
+        F1["1. UI 点击【完成早餐】"]
+        F2["2. UIfurge.writeEvent(BreakfastDone(orderCode))"]
+        F3["3. Worker 收到事件"]
+        F4["4. std.api.get(order_code, breakfast_status=1).Do()"]
+        F5["5. 读取 action.ok"]
+        F6["6A. ok=true：本地标记成功 + Toast 成功"]
+        F7["6B. ok=false：pending 队列 + Toast 失败"]
+        F8["7. action 无引用，等待 GC"]
+    end
+
+    F1 --> F2 --> F3 --> F4 --> F5
+    F5 --> F6 --> F8
+    F5 --> F7 --> F8
+
+    %% =========================
+    %% Mermaid 样式
+    %% =========================
+    classDef longLived fill:#eef7ff,stroke:#2b6cb0,stroke-width:1px,color:#111;
+    classDef shortLived fill:#fff7ed,stroke:#c05621,stroke-width:1px,color:#111;
+    classDef binder fill:#f0fff4,stroke:#2f855a,stroke-width:1px,color:#111;
+    classDef warning fill:#fff5f5,stroke:#c53030,stroke-width:1px,color:#111;
+    classDef lifecycle fill:#f7fafc,stroke:#4a5568,stroke-width:1px,color:#111;
+
+    class STD_API,STD_SCANNER,STD_PIPE,STD_BINDER,STD_UIFURGE,POSTMAN,NETTARGET longLived;
+    class ACTION,UIEVENT,UICOMMAND,GET,POST,DO,GC shortLived;
+    class PIPEFALL_IO,PIPEFALL,ONBIND,IBINDER,BINDER_NOW,AIDL,MESSENGER,RESULT_RECEIVER binder;
+    class R1,R2,R3,R4,R5,R6,R7 warning;
+    class APP_ONCREATE,ACT_ONCREATE,ACT_ONSTART,ACT_ONRESUME,ACT_ONPAUSE,ACT_ONSTOP,ACT_ONDESTROY lifecycle;

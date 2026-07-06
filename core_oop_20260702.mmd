@@ -1,0 +1,110 @@
+classDiagram
+    direction TB
+
+    class std {
+        +Postman api
+        +BarScanner barscanner
+        +PipeFallIO pipefall
+        +IBinder systemIO
+        +UIfurge uifurge
+        +onCreate() std
+        +run() std
+    }
+
+    class Postman {
+        +NetTarget target
+        +get()
+        +post()
+        +onupdate(pipefall: PipeFallIO)
+        +dump()
+    }
+
+    class NetTarget {
+        +scheme
+        +host
+        +port
+        +path
+        +barcode
+        +qrcode
+    }
+
+    class PostmanAction {
+        +ok
+        +done
+        +msg
+        +Do()
+    }
+
+    class OncePostmanAction {
+        <<abstract>>
+        +Do()
+        #runOnce()
+    }
+
+    class GetXwwwAction {
+        +runOnce()
+    }
+
+    class PostJsonAction {
+        +runOnce()
+    }
+
+    class BarScanner {
+        +start()
+        +stop()
+        +destroy()
+        +isRunning()
+        +onScan()
+    }
+
+    class NewBarScanner {
+        +invoke() BarScanner
+    }
+
+    class UIfurge {
+        +bindUI()
+        +render()
+        +onScanInput()
+        +onBreakfastDoneClick()
+        +onBreakfastCancelClick()
+    }
+
+    class PipeFallIO {
+        <<abstract>>
+        +writeEvent()
+        +writeCommand()
+        +writeIPv4Address()
+        +writeNetRoute()
+        +writeBackendTarget()
+    }
+
+    class PipeFall {
+        +writeEvent()
+        +writeCommand()
+        +writeIPv4Address()
+        +writeNetRoute()
+        +writeBackendTarget()
+    }
+
+    class IBinder {
+        <<system>>
+    }
+
+    std *-- Postman : 封装 api
+    std *-- BarScanner : 封装 scanner
+    std *-- UIfurge : 封装 ui
+    std *-- PipeFallIO : 封装 pipe
+    std o-- IBinder : systemIO
+
+    Postman *-- NetTarget : 封装目标地址
+    Postman ..> PostmanAction : 创建一次性动作
+    Postman ..> PipeFallIO : 读取并回吐
+
+    NewBarScanner ..> BarScanner : 工厂创建
+
+    OncePostmanAction ..|> PostmanAction : 上转型抽象
+    GetXwwwAction --|> OncePostmanAction : 继承抽象
+    PostJsonAction --|> OncePostmanAction : 继承抽象
+
+    PipeFall --|> PipeFallIO : 实现抽象
+    PipeFallIO --|> IBinder : 可上转型

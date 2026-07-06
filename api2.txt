@@ -1,0 +1,5 @@
+172.16.203.56:8088/change_breakfast_status get请求
+order_code 订单号  必填
+breakfast_status 状态1是登记，0是取消登记 必填
+breakfast_remark 备注 
+返回code  400错误，200成功 msg错误信息

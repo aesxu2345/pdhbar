@@ -1,0 +1,144 @@
+POST /query_breakfast_right
+用途：扫码后查询客户信息，以及当前是否允许完成早餐。
+请求
+{
+  "order_code": "T202607010001",
+  "card_no": "123456"
+}
+字段：
+order_code  必填，订单号/导检单条码
+card_no     可选，卡号；有就传，没有可不传
+ 
+返回：允许早餐
+{
+  "code": 200,
+  "msg": "ok",
+  "data": {
+    "order_code": "T202607010001",
+    "card_no": "123456",
+    "name_b64": "5byg5LiJ",
+    "sex_b64": "55S3",
+    "phone": "138****8888",
+    "avatar_url": "",
+    "birth_date": "1990-01-01",
+    "package_name_b64": "5L2T5qOA5aWX6aSQ",
+    "has_breakfast": true,
+    "allow_breakfast": true,
+    "breakfast_status": 0,
+    "reason_b64": ""
+  }
+}
+ 
+返回：不允许早餐
+{
+  "code": 200,
+  "msg": "ok",
+  "data": {
+    "order_code": "T202607010001",
+    "card_no": "123456",
+    "name_b64": "5byg5LiJ",
+    "sex_b64": "55S3",
+    "phone": "138****8888",
+    "avatar_url": "",
+    "birth_date": "1990-01-01",
+    "package_name_b64": "5L2T5qOA5aWX6aSQ",
+    "has_breakfast": false,
+    "allow_breakfast": false,
+    "breakfast_status": 0,
+    "reason_b64": "5peg5pep6aSQ5p2D55uK77yM5oiW56m66IW56KGA57OWL+eIq+ƒ..."
+  }
+}
+ 
+字段说明
+order_code
+    订单号
+
+card_no
+    卡号
+
+name_b64
+    姓名，UTF-8 后 Base64
+
+sex_b64
+    性别，UTF-8 后 Base64
+
+phone
+    手机号，建议脱敏
+
+avatar_url
+    头像地址，没有就空字符串
+
+birth_date
+    出生日期，yyyy-MM-dd
+
+package_name_b64
+    套餐名称，UTF-8 后 Base64
+
+has_breakfast
+    冗余字段，仅展示/调试用
+    前端不要用它做业务分支
+
+allow_breakfast
+    唯一判定字段
+    true  = 允许点击完成早餐
+    false = 禁止点击完成早餐
+
+breakfast_status
+    0 = 未完成早餐
+    1 = 已完成早餐
+
+reason_b64
+    不允许早餐的原因，UTF-8 后 Base64
+    例如：无早餐权益 / 空腹血糖未完成 / 腹部B超未完成 / 已完成早餐
+ 
+前端判断逻辑
+只看 allow_breakfast 和 breakfast_status。
+allow_breakfast = true && breakfast_status = 0
+    完成早餐按钮可点击
+
+allow_breakfast = false
+    完成早餐按钮置灰
+    展示 reason_b64 解码后的原因
+
+breakfast_status = 1
+    完成早餐按钮置灰
+    显示已完成早餐
+不要写成：
+if has_breakfast == false
+    ...
+else if allow_breakfast == false
+    ...
+统一写成：
+if allow_breakfast == false
+    展示 reason
+    禁用完成按钮
+ 
+Kotlin 数据结构
+data class BreakfastRightRequest(
+    val order_code: String,
+    val card_no: String? = null
+)
+data class BreakfastRightResponse(
+    val code: Int,
+    val msg: String?,
+    val data: BreakfastRightData?
+)
+data class BreakfastRightData(
+    val order_code: String,
+    val card_no: String?,
+    val name_b64: String?,
+    val sex_b64: String?,
+    val phone: String?,
+    val avatar_url: String?,
+    val birth_date: String?,
+    val package_name_b64: String?,
+    val has_breakfast: Boolean?,
+    val allow_breakfast: Boolean,
+    val breakfast_status: Int,
+    val reason_b64: String?
+)
+ 
+最终原则
+后端负责判断为什么不允许早餐。
+前端只展示原因，不拆业务。
+前端只根据 allow_breakfast 决定按钮能不能点。
