@@ -21,7 +21,9 @@ The complete license and notice files included with this repository are:
 Neither the name "UIKitInsight" nor the names of its project owner or
 contributors may be used to endorse or promote this product without prior
 written permission. Inclusion of these notices does not grant any additional
-license or authorization.# Third-Party Notices
+license or authorization.
+
+## Other third-party components
 
 本项目使用以下开源组件。各组件版权归其原作者所有，并遵循其各自许可协议。
 
