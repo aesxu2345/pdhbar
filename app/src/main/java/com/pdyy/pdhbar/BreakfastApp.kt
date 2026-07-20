@@ -5,6 +5,8 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.Handler
@@ -14,6 +16,7 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
+import android.util.Base64
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.Toast
@@ -35,6 +38,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -54,6 +58,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -84,6 +89,8 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
@@ -108,7 +115,9 @@ import com.uikit.insight.UIEventStruct
 import com.uikit.insight.UIInsightCss
 import com.uikit.insight.UIInsightPlayConfig
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONException
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -120,6 +129,8 @@ private val GlassBlack = Color(0xD90A0B0F)
 private const val ScanRepeatDelayMs = 6_000L
 private const val APP_TAG = "BreakfastApp"
 private const val UiSettingsPrefsName = "breakfast_ui_settings"
+private const val IdPhotoWidthPx = 358
+private const val IdPhotoHeightPx = 441
 private const val InsightPanelAddressKey = "insight_panel_address"
 private const val DefaultInsightPanelAddress = "172.16.203.56"
 private const val InsightFirstRouteKey = "insight_first_route"
@@ -1298,6 +1309,12 @@ private fun CustomerDialog(
         title = { Text("客户早餐信息") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                CustomerPhoto(
+                    orderCode = customer.orderCode,
+                    avatarBase64 = customer.avatarBase64,
+                    avatarUrl = customer.avatarUrl,
+                    querying = customer.querying
+                )
                 Text("导检单：${customer.orderCode}")
                 Text("姓名：${customer.name}")
                 Text("套餐：${customer.packageName ?: "-"}")
@@ -1318,6 +1335,74 @@ private fun CustomerDialog(
             }
         }
     )
+}
+
+@Composable
+private fun CustomerPhoto(
+    orderCode: String,
+    avatarBase64: String?,
+    avatarUrl: String?,
+    querying: Boolean
+) {
+    var bitmap by remember(orderCode, avatarBase64) { mutableStateOf<Bitmap?>(null) }
+    var loading by remember(orderCode, avatarBase64) { mutableStateOf(!querying && avatarBase64 != null) }
+
+    LaunchedEffect(orderCode, avatarBase64) {
+        bitmap = null
+        loading = !querying && avatarBase64 != null
+        if (avatarBase64 != null) {
+            bitmap = withContext(Dispatchers.Default) {
+                decodeStrictIdPhoto(avatarBase64)
+            }
+        }
+        loading = false
+    }
+
+    Box(
+        modifier = Modifier
+            .width(98.dp)
+            .aspectRatio(IdPhotoWidthPx.toFloat() / IdPhotoHeightPx)
+            .clip(RoundedCornerShape(10.dp))
+            .background(Color(0xFFE4ECE7)),
+        contentAlignment = Alignment.Center
+    ) {
+        val photo = bitmap
+        if (photo != null) {
+            Image(
+                bitmap = photo.asImageBitmap(),
+                contentDescription = "客户证件照",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Text(
+                text = when {
+                    querying || loading -> "照片加载中"
+                    avatarBase64 == null && avatarUrl != null -> "照片待扩展"
+                    else -> "暂无照片"
+                },
+                color = Color(0xFF52645A),
+                fontSize = 12.sp
+            )
+        }
+    }
+}
+
+private fun decodeStrictIdPhoto(encoded: String): Bitmap? {
+    return runCatching {
+        val bytes = Base64.decode(encoded, Base64.NO_WRAP)
+        require(bytes.size >= 4 &&
+            bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() &&
+            bytes[bytes.lastIndex - 1] == 0xFF.toByte() && bytes[bytes.lastIndex] == 0xD9.toByte()
+        ) { "avatar_b64 must be JPEG" }
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        require(bounds.outMimeType == "image/jpeg") { "avatar_b64 must be JPEG" }
+        require(bounds.outWidth == IdPhotoWidthPx && bounds.outHeight == IdPhotoHeightPx) {
+            "avatar_b64 must be ${IdPhotoWidthPx}x${IdPhotoHeightPx}"
+        }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    }.getOrNull()
 }
 
 @Composable

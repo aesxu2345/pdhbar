@@ -1010,6 +1010,7 @@ sealed interface UiCommand {
         val name: String,
         val sex: String?,
         val phone: String?,
+        val avatarBase64: String?,
         val avatarUrl: String?,
         val birthDate: String?,
         val packageName: String?,
@@ -1091,6 +1092,7 @@ class PipeFall : PipeFallIO() {
                         name = "N/A 查询中",
                         sex = null,
                         phone = null,
+                        avatarBase64 = null,
                         avatarUrl = null,
                         birthDate = null,
                         packageName = "N/A 查询中",
@@ -1228,6 +1230,7 @@ class PipeFall : PipeFallIO() {
                     name = breakfastRight.name,
                     sex = breakfastRight.sex,
                     phone = breakfastRight.phone,
+                    avatarBase64 = breakfastRight.avatarBase64,
                     avatarUrl = breakfastRight.avatarUrl,
                     birthDate = breakfastRight.birthDate,
                     packageName = breakfastRight.packageName,
@@ -1308,6 +1311,7 @@ private data class BreakfastRightView(
     val name: String,
     val sex: String?,
     val phone: String?,
+    val avatarBase64: String?,
     val avatarUrl: String?,
     val birthDate: String?,
     val packageName: String?,
@@ -1466,13 +1470,17 @@ private fun ByteArray.indexOfHeaderEnd(): Int {
 
 private fun parseBreakfastRight(json: String): BreakfastRightView? {
     val orderCode = json.stringField("order_code") ?: return null
+    val avatarBase64 = json.nullableStringField("avatar_b64")
+    val avatarUrl = json.nullableStringField("avatar_url")
+    if (avatarBase64 == null && avatarUrl == null) return null
     return BreakfastRightView(
         orderCode = orderCode,
         cardNo = json.nullableStringField("card_no"),
         name = json.base64Field("name_b64") ?: "未知客户",
         sex = json.base64Field("sex_b64"),
         phone = json.nullableStringField("phone"),
-        avatarUrl = json.nullableStringField("avatar_url"),
+        avatarBase64 = avatarBase64,
+        avatarUrl = avatarUrl,
         birthDate = json.nullableStringField("birth_date"),
         packageName = json.base64Field("package_name_b64"),
         hasBreakfast = json.booleanField("has_breakfast") ?: false,

@@ -19,6 +19,7 @@ card_no     可选，卡号；有就传，没有可不传
     "name_b64": "5byg5LiJ",
     "sex_b64": "55S3",
     "phone": "138****8888",
+    "avatar_b64": "<358x441 JPEG 的纯 Base64>",
     "avatar_url": "",
     "birth_date": "1990-01-01",
     "package_name_b64": "5L2T5qOA5aWX6aSQ",
@@ -39,6 +40,7 @@ card_no     可选，卡号；有就传，没有可不传
     "name_b64": "5byg5LiJ",
     "sex_b64": "55S3",
     "phone": "138****8888",
+    "avatar_b64": "<358x441 JPEG 的纯 Base64>",
     "avatar_url": "",
     "birth_date": "1990-01-01",
     "package_name_b64": "5L2T5qOA5aWX6aSQ",
@@ -65,8 +67,18 @@ sex_b64
 phone
     手机号，建议脱敏
 
+avatar_b64
+    客户证件照。JPEG 文件内容使用标准 Base64 编码，不带 data:image 前缀
+    解码后的图片必须严格为 358 × 441 px，且文件格式必须为 JPEG
+    图片解码和尺寸校验失败时，客户端显示占位头像，不阻塞审批弹窗
+
 avatar_url
-    头像地址，没有就空字符串
+    头像地址预留字段，供未来业务扩展，当前客户端不发起 URL 图片请求
+
+头像字段约束
+    avatar_b64 与 avatar_url 至少一个必须为非空字符串
+    两者同时存在时 avatar_b64 优先，avatar_url 不参与当前照片展示
+    当前业务若要求立即展示证件照，后端必须返回有效 avatar_b64
 
 birth_date
     出生日期，yyyy-MM-dd
@@ -129,6 +141,7 @@ data class BreakfastRightData(
     val name_b64: String?,
     val sex_b64: String?,
     val phone: String?,
+    val avatar_b64: String?,
     val avatar_url: String?,
     val birth_date: String?,
     val package_name_b64: String?,
@@ -142,3 +155,4 @@ data class BreakfastRightData(
 后端负责判断为什么不允许早餐。
 前端只展示原因，不拆业务。
 前端只根据 allow_breakfast 决定按钮能不能点。
+审批弹窗先显示固定尺寸照片占位框，再异步解码 avatar_b64；新扫码会取消上一客户的照片任务。
