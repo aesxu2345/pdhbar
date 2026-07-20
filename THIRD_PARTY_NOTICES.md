@@ -1,5 +1,28 @@
 # Third-Party Notices
 
+## UIKitInsight
+
+This product includes UIKitInsight software developed by the UIKitInsight
+contributors.
+
+UIKitInsight is sourced from
+<https://github.com/aesxu2345/insight-board-kit> and is distributed separately
+from pdhbar's MIT-licensed source code. Its use is governed by either:
+
+- the PolyForm Free Trial License 1.0.0; or
+- a valid UIKitInsight Commercial Integration License within its agreed scope.
+
+The complete license and notice files included with this repository are:
+
+- [`uikit/LICENSE`](uikit/LICENSE)
+- [`uikit/COMMERCIAL-INTEGRATION-LICENSE.md`](uikit/COMMERCIAL-INTEGRATION-LICENSE.md)
+- [`uikit/NOTICE`](uikit/NOTICE)
+
+Neither the name "UIKitInsight" nor the names of its project owner or
+contributors may be used to endorse or promote this product without prior
+written permission. Inclusion of these notices does not grant any additional
+license or authorization.# Third-Party Notices
+
 本项目使用以下开源组件。各组件版权归其原作者所有，并遵循其各自许可协议。
 
 ## Android / Kotlin
