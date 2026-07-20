@@ -18,6 +18,7 @@ import android.util.Log
 import android.view.KeyEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -1063,13 +1064,18 @@ class PipeFall : PipeFallIO() {
         private set
     override var latestNetRoute: NetRoute? = null
         private set
-    private var queryInFlight = false
+    private var queryJob: Job? = null
+    private var querySequence = 0L
     private val blockedBreakfastOrders = mutableMapOf<String, String>()
 
     init {
         workerScope.launch {
             eventSocket.collect { event ->
-                handleEvent(event)
+                when (event) {
+                    is UiEvent.ScanCode -> startCustomerQuery(event.code)
+                    UiEvent.DialogCancel -> cancelCustomerQuery()
+                    else -> handleEvent(event)
+                }
             }
         }
     }
@@ -1077,7 +1083,7 @@ class PipeFall : PipeFallIO() {
     override fun writeEvent(event: UiEvent) {
         if (event is UiEvent.ScanCode) {
             latestScanCode = ScanCodePayload(event.code)
-            if (!queryInFlight && event.code.isNotBlank()) {
+            if (event.code.isNotBlank()) {
                 writeCommand(
                     UiCommand.ShowCustomer(
                         orderCode = event.code,
@@ -1133,7 +1139,7 @@ class PipeFall : PipeFallIO() {
 
     private suspend fun handleEvent(event: UiEvent) {
         when (event) {
-            is UiEvent.ScanCode -> showCustomer(event.code)
+            is UiEvent.ScanCode -> startCustomerQuery(event.code)
             is UiEvent.BreakfastDone -> changeBreakfastStatus(
                 orderCode = event.orderCode,
                 status = "1",
@@ -1151,22 +1157,33 @@ class PipeFall : PipeFallIO() {
             )
 
             is UiEvent.ActionNotice -> writeCommand(UiCommand.Toast(event.message))
-            UiEvent.DialogCancel -> writeCommand(UiCommand.CloseDialog)
+            UiEvent.DialogCancel -> cancelCustomerQuery()
         }
     }
 
-    private suspend fun showCustomer(orderCode: String) {
+    private fun startCustomerQuery(orderCode: String) {
         if (orderCode.isBlank()) {
             writeCommand(UiCommand.Toast("导检单条码不能为空"))
             return
         }
 
-        if (queryInFlight) {
-            writeCommand(UiCommand.Toast("正在查询，请稍候"))
-            return
+        val requestSequence = ++querySequence
+        queryJob?.cancel()
+        queryJob = workerScope.launch {
+            showCustomer(orderCode, requestSequence)
         }
+    }
 
-        queryInFlight = true
+    private fun cancelCustomerQuery() {
+        querySequence += 1
+        writeCommand(UiCommand.CloseDialog)
+    }
+
+    private fun isCurrentCustomerQuery(requestSequence: Long): Boolean {
+        return requestSequence == querySequence
+    }
+
+    private suspend fun showCustomer(orderCode: String, requestSequence: Long) {
         writeCommand(UiCommand.Toast("正在查询早餐权益..."))
 
         try {
@@ -1179,6 +1196,8 @@ class PipeFall : PipeFallIO() {
                     "card_no" to null
                 )
             ).Do()
+
+            if (!isCurrentCustomerQuery(requestSequence)) return
 
             if (action !is PostJsonAction || !action.ok) {
                 Log.w(RUNTIME_TAG, "query failed: ${action.msg}")
@@ -1194,6 +1213,7 @@ class PipeFall : PipeFallIO() {
                 writeCommand(UiCommand.CloseDialog)
                 return
             }
+            if (!isCurrentCustomerQuery(requestSequence)) return
             val blockReason = breakfastRight.blockReason()
             if (blockReason == null) {
                 blockedBreakfastOrders.remove(breakfastRight.orderCode)
@@ -1217,7 +1237,13 @@ class PipeFall : PipeFallIO() {
                 )
             )
         } finally {
-            queryInFlight = false
+            if (isCurrentCustomerQuery(requestSequence)) {
+                queryJob = null
+            }
+            Log.d(
+                RUNTIME_TAG,
+                "customer query finished: orderCode=$orderCode current=${isCurrentCustomerQuery(requestSequence)}"
+            )
         }
     }
 

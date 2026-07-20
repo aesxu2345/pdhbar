@@ -1,0 +1,43 @@
+UIKitInsight License Notice
+===========================
+
+SPDX-License-Identifier: PolyForm-Free-Trial-1.0.0 OR LicenseRef-UIKitInsight-Commercial-Integration
+
+Copyright (c) UIKitInsight contributors.
+
+Default License
+---------------
+
+Unless a separate written commercial license applies, UIKitInsight is licensed
+under the PolyForm Free Trial License 1.0.0.
+
+Reference:
+https://polyformproject.org/licenses/free-trial/1.0.0
+
+The PolyForm Free Trial License is the default source-available trial license
+for this project. It governs evaluation, trial, and other permitted uses under
+that license.
+
+Commercial Integration License
+------------------------------
+
+UIKitInsight may also be used under the UIKitInsight Commercial Integration
+License when the licensee has a written commercial agreement, order form,
+purchase record, or other written authorization from the project owner.
+
+The Commercial Integration License permits closed-source integration,
+production use, and distribution within the agreed scope. See:
+
+COMMERCIAL-INTEGRATION-LICENSE.md
+
+Notices
+-------
+
+Redistributions, integrations, product pages, advertising materials, and
+documentation that mention UIKitInsight, its features, or use of this software
+must comply with NOTICE.
+
+The NOTICE file includes BSD-4-Clause-style advertising acknowledgement,
+non-endorsement, and no-additional-authorization terms. Those notice terms do
+not create any extra license grant beyond the PolyForm Free Trial License 1.0.0
+or a valid Commercial Integration License.

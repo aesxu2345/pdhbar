@@ -14,6 +14,8 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
+import android.view.ViewGroup
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -47,8 +49,10 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -67,6 +71,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -97,8 +102,15 @@ import com.pdyy.pdhbar.runtime.PipeFallIO
 import com.pdyy.pdhbar.runtime.UiCommand
 import com.pdyy.pdhbar.runtime.std
 import com.pdyy.pdhbar.scanner.MLKitBarcodeAnalyzer
+import com.uikit.insight.NewUIInsightPlay
+import com.uikit.insight.OnCardNo
+import com.uikit.insight.UIEventStruct
+import com.uikit.insight.UIInsightCss
+import com.uikit.insight.UIInsightPlayConfig
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.json.JSONException
+import org.json.JSONObject
 import java.util.concurrent.Executors
 
 private val ScannerLineColor = Color(0xFF0A653A)
@@ -107,6 +119,55 @@ private val FlashlightGreen = ScannerLineColor
 private val GlassBlack = Color(0xD90A0B0F)
 private const val ScanRepeatDelayMs = 6_000L
 private const val APP_TAG = "BreakfastApp"
+private const val UiSettingsPrefsName = "breakfast_ui_settings"
+private const val InsightPanelAddressKey = "insight_panel_address"
+private const val DefaultInsightPanelAddress = "172.16.203.56"
+private const val InsightFirstRouteKey = "insight_first_route"
+private const val InsightSecondRouteKey = "insight_second_route"
+private const val DefaultInsightRoute = "http://129.153.98.122:8080/ZbXiOJvl_u0yYmWK/BKheVq-FzHT3oXfIozIanpfrXFG9wJB7ts9WNw8Snvn5XoSj8Fi08ju1YfaH8fk1Zeuug9QKq5u7YbACoxHpV7KCiOPoDREU1MhXj_5bbHUX54-dDiyEaKFULdhQ8wMAaaASUfkQ3GdmKyHtOTUc6Nkv9gXXuYI3asu6NmtYdJ_O5hKypr9QV8Cmcaycud4voUdeszcJrHM6ViDFCGi5uFaFX4xfQ-GaxKzyvBz9qUIooQ_lAw9Zy7A8wW7NPpQ5c3aB9Ewc7WFPWcHj79NgeQv73bslsat1DhAtirGjXcMIfvTv8fjED6oWdmm95T9pq_TWa8wpz8BZH8dVK-bJOQ"
+private const val DefaultInsightFirstRoute = "$DefaultInsightRoute/provider"
+// Keep UIKit's built-in signed-route verification enabled.
+private const val BypassUIKitRouteSignatureCheck = false
+
+private fun defaultInsightFirstRoute(): String = DefaultInsightFirstRoute
+
+private fun defaultInsightSecondRoute(): String = DefaultInsightRoute
+
+private class BreakfastInsightConfig(
+    insightPanelAddress: String,
+    firstRouteUrl: String,
+    secondRouteUrl: String
+) : UIInsightPlayConfig {
+    override val ip: String = insightPanelAddress.ifBlank { DefaultInsightPanelAddress }
+    override val firstRoute: String = firstRouteUrl.ifBlank { defaultInsightFirstRoute() }
+    override val secondRoute: String = secondRouteUrl.ifBlank { defaultInsightSecondRoute() }
+    override val bypass: Boolean = BypassUIKitRouteSignatureCheck
+}
+
+private fun createUIKitInsight(
+    config: BreakfastInsightConfig,
+    css: UIInsightCss
+): NewUIInsightPlay {
+    check(!config.bypass) { "pdhbar requires UIKit signed-route verification" }
+    val insight = UIKitInsightFactory.create(config, css)
+    check(!insight.bypass) { "UIKit factory unexpectedly enabled route signature bypass" }
+    Log.i(
+        APP_TAG,
+        "UIKit signed-route verification enabled; " +
+            "firstRoute=${insight.firstRoute}, secondRoute=${insight.secondRoute}"
+    )
+    return insight
+}
+
+private data class UiJsonSettings(
+    val scheme: String,
+    val host: String,
+    val port: Int,
+    val insightPanelAddress: String,
+    val insightFirstRoute: String,
+    val insightSecondRoute: String
+)
+
 private val OpenSourceLicenseText = """
 浦医早餐权益审核
 
@@ -246,17 +307,97 @@ private fun exitApp(context: Context) {
     }, 120L)
 }
 
+private fun readInsightPanelAddress(context: Context): String {
+    return context.getSharedPreferences(UiSettingsPrefsName, Context.MODE_PRIVATE)
+        .getString(InsightPanelAddressKey, DefaultInsightPanelAddress)
+        ?.takeIf(String::isNotBlank)
+        ?: DefaultInsightPanelAddress
+}
+
+private fun readInsightFirstRoute(context: Context): String {
+    val fallback = defaultInsightFirstRoute()
+    return context.getSharedPreferences(UiSettingsPrefsName, Context.MODE_PRIVATE)
+        .getString(InsightFirstRouteKey, fallback)
+        ?.takeIf(String::isNotBlank)
+        ?: fallback
+}
+
+private fun readInsightSecondRoute(context: Context): String {
+    val fallback = defaultInsightSecondRoute()
+    return context.getSharedPreferences(UiSettingsPrefsName, Context.MODE_PRIVATE)
+        .getString(InsightSecondRouteKey, fallback)
+        ?.takeIf(String::isNotBlank)
+        ?: fallback
+}
+
+private fun writeInsightPanelAddress(context: Context, address: String) {
+    context.getSharedPreferences(UiSettingsPrefsName, Context.MODE_PRIVATE)
+        .edit()
+        .putString(InsightPanelAddressKey, address.ifBlank { DefaultInsightPanelAddress })
+        .apply()
+}
+
+private fun writeInsightRoutes(context: Context, firstRoute: String, secondRoute: String) {
+    context.getSharedPreferences(UiSettingsPrefsName, Context.MODE_PRIVATE)
+        .edit()
+    .putString(InsightFirstRouteKey, firstRoute.ifBlank { defaultInsightFirstRoute() })
+    .putString(InsightSecondRouteKey, secondRoute.ifBlank { defaultInsightSecondRoute() })
+        .apply()
+}
+
+private fun UiJsonSettings.toPrettyJson(): String {
+    return JSONObject()
+        .put("backendApi", JSONObject().put("scheme", scheme).put("host", host).put("port", port))
+        .put("insightPanelAddress", insightPanelAddress)
+        .put("insightRoutes", JSONObject().put("firstRoute", insightFirstRoute).put("secondRoute", insightSecondRoute))
+        .toString(2)
+}
+
+private fun parseUiJsonSettings(text: String): Result<UiJsonSettings> {
+    return runCatching {
+        val root = JSONObject(text)
+        val backend = root.optJSONObject("backendApi") ?: throw JSONException("缺少 backendApi 对象")
+        val scheme = backend.optString("scheme").trim().lowercase()
+        val host = backend.optString("host").trim()
+        val port = backend.optInt("port", -1)
+        val insightPanelAddress = root.optString("insightPanelAddress").trim()
+        val insightRoutes = root.optJSONObject("insightRoutes") ?: throw JSONException("缺少 insightRoutes 对象")
+        val insightFirstRoute = insightRoutes.optString("firstRoute").trim()
+        val insightSecondRoute = insightRoutes.optString("secondRoute").trim()
+
+        require(scheme == "http" || scheme == "https") { "backendApi.scheme 只能是 http 或 https" }
+        require(host.isNotBlank()) { "backendApi.host 不能为空" }
+        require(port in 1..65535) { "backendApi.port 必须在 1..65535" }
+        require(insightPanelAddress.isNotBlank()) { "insightPanelAddress 不能为空" }
+        require(insightFirstRoute.startsWith("http://") || insightFirstRoute.startsWith("https://")) { "insightRoutes.firstRoute 必须是 http/https URL" }
+        require(insightSecondRoute.startsWith("http://") || insightSecondRoute.startsWith("https://")) { "insightRoutes.secondRoute 必须是 http/https URL" }
+
+        UiJsonSettings(
+            scheme = scheme,
+            host = host,
+            port = port,
+            insightPanelAddress = insightPanelAddress,
+            insightFirstRoute = insightFirstRoute,
+            insightSecondRoute = insightSecondRoute
+        )
+    }
+}
+
 @Composable
 fun BreakfastApp() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var customer by remember { mutableStateOf<UiCommand.ShowCustomer?>(null) }
-    var drawerOpen by remember { mutableStateOf(false) }
     var manualInputOpen by remember { mutableStateOf(false) }
     var backendDialogOpen by remember { mutableStateOf(false) }
     var licenseDialogOpen by remember { mutableStateOf(false) }
     var exitConfirmOpen by remember { mutableStateOf(false) }
+    var uiLayerVisible by remember { mutableStateOf(true) }
     var manualCode by remember { mutableStateOf("") }
     var scannerGunMode by remember { mutableStateOf(std.run().scannerGunMode) }
+    var insightPanelAddress by remember { mutableStateOf(readInsightPanelAddress(context)) }
+    var insightFirstRoute by remember { mutableStateOf(readInsightFirstRoute(context)) }
+    var insightSecondRoute by remember { mutableStateOf(readInsightSecondRoute(context)) }
 
     LaunchedEffect(Unit) {
         std.run().pipefall.commands.collect { command ->
@@ -272,36 +413,52 @@ fun BreakfastApp() {
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF050806))
+            .navigationBarsPadding()
     ) {
         ScannerPreviewCard(
             modifier = Modifier.fillMaxSize(),
             scannerGunMode = scannerGunMode,
-            onScanned = { code -> std.run().barscanner.onScan(code) },
+            onBackToInsight = { uiLayerVisible = true },
+            onScanned = { code ->
+                std.run().barscanner.onScan(code)
+            },
             onPencilClick = {
                 std.run().uifurge.onPencilButtonClick()
                 manualInputOpen = true
-            },
-            onMenuClick = {
-                std.run().uifurge.onMenuButtonClick()
-                drawerOpen = true
             }
         )
-        RightThanksDrawer(
-            open = drawerOpen,
-            onClose = { drawerOpen = false },
-            onBackendTargetClick = { backendDialogOpen = true },
-            onManualInputClick = { manualInputOpen = true },
-            onLicenseClick = { licenseDialogOpen = true },
-            scannerGunMode = scannerGunMode,
-            onScannerGunModeClick = {
-                val enabled = !scannerGunMode
-                std.run().setScannerGunMode(enabled)
-                std.save(context.applicationContext)
-                Log.d(APP_TAG, "scanner gun mode saved=$enabled, waiting app exit before hardware switch")
-                exitConfirmOpen = true
-            },
-            modifier = Modifier.align(Alignment.CenterEnd)
-        )
+        if (uiLayerVisible) {
+            UIKitInsightLayer(
+                modifier = Modifier.fillMaxSize(),
+                onManualInputClick = {
+                    uiLayerVisible = false
+                    manualInputOpen = true
+                },
+                onBackendTargetClick = { backendDialogOpen = true },
+                onCameraInfraredSwitch = {
+                    val enabled = !scannerGunMode
+                    scannerGunMode = enabled
+                    std.run().setScannerGunMode(enabled)
+                    std.save(context.applicationContext)
+                    Log.d(APP_TAG, "scanner gun mode saved=$enabled, waiting app exit before hardware switch")
+                    exitConfirmOpen = true
+                },
+                onLicenseClick = { licenseDialogOpen = true },
+                onOpenScanner = { uiLayerVisible = false },
+                insightPanelAddress = insightPanelAddress,
+                insightFirstRoute = insightFirstRoute,
+                insightSecondRoute = insightSecondRoute,
+                onInsightCardNo = { cardNo ->
+                    scope.launch {
+                        std.run().barscanner.onScan(cardNo)
+                    }
+                }
+            )
+        }
+    }
+
+    BackHandler(enabled = !uiLayerVisible && !exitConfirmOpen) {
+        uiLayerVisible = true
     }
 
     customer?.let { data ->
@@ -309,7 +466,10 @@ fun BreakfastApp() {
             customer = data,
             onDone = { std.run().uifurge.onBreakfastDoneClick(data.orderCode) },
             onCancelBreakfast = { std.run().uifurge.onBreakfastCancelClick(data.orderCode) },
-            onDismiss = { std.run().uifurge.onDialogCancelClick() }
+            onDismiss = {
+                customer = null
+                std.run().uifurge.onDialogCancelClick()
+            }
         )
     }
 
@@ -327,8 +487,11 @@ fun BreakfastApp() {
 
     if (backendDialogOpen) {
         BackendTargetDialog(
+            insightPanelAddress = insightPanelAddress,
+            insightFirstRoute = insightFirstRoute,
+            insightSecondRoute = insightSecondRoute,
             onDismiss = { backendDialogOpen = false },
-            onConfirm = { scheme, host, port ->
+            onConfirm = { settings ->
                 val runtime = std.run()
                 val systemPipe = runtime.systemIO as? PipeFallIO
                 if (systemPipe == null) {
@@ -337,12 +500,17 @@ fun BreakfastApp() {
                     return@BackendTargetDialog
                 }
                 systemPipe.writeBackendTarget(
-                    address = IPv4Address(host),
-                    route = NetRoute(scheme = scheme, port = port)
+                    address = IPv4Address(settings.host),
+                    route = NetRoute(scheme = settings.scheme, port = settings.port)
                 )
                 runtime.api.onupdate(systemPipe)
+                insightPanelAddress = settings.insightPanelAddress
+                insightFirstRoute = settings.insightFirstRoute
+                insightSecondRoute = settings.insightSecondRoute
+                writeInsightPanelAddress(context, settings.insightPanelAddress)
+                writeInsightRoutes(context, settings.insightFirstRoute, settings.insightSecondRoute)
                 std.save(context.applicationContext)
-                Toast.makeText(context, "后端地址已保存", Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "设置已保存", Toast.LENGTH_SHORT).show()
                 backendDialogOpen = false
             }
         )
@@ -364,12 +532,109 @@ fun BreakfastApp() {
 }
 
 @Composable
+private fun UIKitInsightLayer(
+    modifier: Modifier = Modifier,
+    onManualInputClick: () -> Unit,
+    onBackendTargetClick: () -> Unit,
+    onCameraInfraredSwitch: () -> Unit,
+    onLicenseClick: () -> Unit,
+    onOpenScanner: () -> Unit,
+    insightPanelAddress: String,
+    insightFirstRoute: String,
+    insightSecondRoute: String,
+    onInsightCardNo: (String) -> Unit
+) {
+    val currentOnInsightCardNo by rememberUpdatedState(onInsightCardNo)
+    val eventHandler = remember(
+        onManualInputClick,
+        onBackendTargetClick,
+        onCameraInfraredSwitch,
+        onLicenseClick,
+        onOpenScanner
+    ) {
+        object : UIEventStruct() {
+            override fun onManualBarcodeInput() {
+                onManualInputClick()
+            }
+
+            override fun onConfigureBackendAddress() {
+                onBackendTargetClick()
+            }
+
+            override fun onCameraInfraredSwitch() {
+                onCameraInfraredSwitch()
+            }
+
+            override fun onOpenSourceLicenses() {
+                onLicenseClick()
+            }
+
+            override fun onScanRegistration() {
+                onOpenScanner()
+            }
+
+            override fun onSettings() {
+                onBackendTargetClick()
+            }
+
+            override fun onOpenScanner() {
+                onOpenScanner()
+            }
+        }
+    }
+
+    val insight = remember(eventHandler, insightPanelAddress, insightFirstRoute, insightSecondRoute) {
+        createUIKitInsight(
+            BreakfastInsightConfig(insightPanelAddress, insightFirstRoute, insightSecondRoute),
+            UIInsightCss(
+                "uikit_insight/index.html",
+                18f,
+                156f,
+                88f,
+                "#f7faf7",
+                "#18813b"
+            )
+        ).also { it.OnClickUIEvent(eventHandler) }
+    }
+
+    DisposableEffect(insight) {
+        val cardNoExecutor = Executors.newSingleThreadExecutor()
+        insight.OnCardNo.enroll(
+            object : OnCardNo() {
+                override fun event(str: String) {
+                    str.takeIf(String::isNotBlank)?.let(currentOnInsightCardNo)
+                }
+            }
+        )
+        cardNoExecutor.execute { insight.OnCardNo.run() }
+
+        onDispose {
+            insight.Destory()
+            cardNoExecutor.shutdownNow()
+        }
+    }
+
+    AndroidView(
+        modifier = modifier,
+        factory = { viewContext ->
+            FrameLayout(viewContext).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                insight.Display(viewContext, this)
+            }
+        }
+    )
+}
+
+@Composable
 private fun ScannerPreviewCard(
     modifier: Modifier = Modifier,
     scannerGunMode: Boolean,
+    onBackToInsight: () -> Unit,
     onScanned: suspend (String) -> Unit,
-    onPencilClick: () -> Unit,
-    onMenuClick: () -> Unit
+    onPencilClick: () -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -587,11 +852,12 @@ private fun ScannerPreviewCard(
                 )
             }
 
-            MenuBadge(
+            InsightReturnBadge(
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 34.dp, end = 22.dp),
-                onClick = onMenuClick
+                    .align(Alignment.TopStart)
+                    .statusBarsPadding()
+                    .padding(start = 16.dp, top = 12.dp),
+                onClick = onBackToInsight
             )
 
             Box(
@@ -616,6 +882,43 @@ private fun ScannerPreviewCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun InsightReturnBadge(modifier: Modifier = Modifier, onClick: () -> Unit) {
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(22.dp))
+            .background(ScannerLineColor)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Canvas(modifier = Modifier.size(18.dp)) {
+            val strokeWidth = 2.4.dp.toPx()
+            drawLine(
+                color = ScannerIconLineColor,
+                start = Offset(size.width * 0.78f, size.height * 0.18f),
+                end = Offset(size.width * 0.32f, size.height * 0.5f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+            drawLine(
+                color = ScannerIconLineColor,
+                start = Offset(size.width * 0.32f, size.height * 0.5f),
+                end = Offset(size.width * 0.78f, size.height * 0.82f),
+                strokeWidth = strokeWidth,
+                cap = StrokeCap.Round
+            )
+        }
+        Text(
+            text = "Insight",
+            color = ScannerIconLineColor,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Bold
+        )
     }
 }
 
@@ -876,30 +1179,56 @@ private fun ManualInputDialog(
 
 @Composable
 private fun BackendTargetDialog(
+    insightPanelAddress: String,
+    insightFirstRoute: String,
+    insightSecondRoute: String,
     onDismiss: () -> Unit,
-    onConfirm: (scheme: String, host: String, port: Int) -> Unit
+    onConfirm: (UiJsonSettings) -> Unit
 ) {
     val target = std.run().api.target
-    var scheme by remember { mutableStateOf(target.scheme) }
-    var host by remember { mutableStateOf(target.host) }
-    var portText by remember { mutableStateOf(target.port.toString()) }
-    val port = portText.toIntOrNull()
-    val canSave = scheme.isNotBlank() && host.isNotBlank() && port != null && port in 1..65535
+    var jsonText by remember {
+        mutableStateOf(
+            UiJsonSettings(
+                scheme = target.scheme,
+                host = target.host,
+                port = target.port,
+                insightPanelAddress = insightPanelAddress,
+                insightFirstRoute = insightFirstRoute,
+                insightSecondRoute = insightSecondRoute
+            ).toPrettyJson()
+        )
+    }
+    val parsedSettings = remember(jsonText) { parseUiJsonSettings(jsonText) }
+    val errorMessage = parsedSettings.exceptionOrNull()?.message
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("配置后端 API") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(value = scheme, onValueChange = { scheme = it.trim() }, singleLine = true, label = { Text("协议 / scheme") })
-                OutlinedTextField(value = host, onValueChange = { host = it.trim() }, singleLine = true, label = { Text("IPv4 地址") })
-                OutlinedTextField(value = portText, onValueChange = { portText = it.filter(Char::isDigit) }, singleLine = true, label = { Text("端口") })
+                OutlinedTextField(
+                    value = jsonText,
+                    onValueChange = { jsonText = it },
+                    minLines = 8,
+                    maxLines = 14,
+                    label = { Text("JSON 设置") },
+                    textStyle = TextStyle(fontSize = 13.sp, lineHeight = 18.sp),
+                    isError = errorMessage != null
+                )
+                errorMessage?.let { Text(it, color = Color(0xFFD32F2F), fontSize = 12.sp) }
                 Text("POST 固定：/query_breakfast_right")
                 Text("GET 固定：/change_breakfast_status")
+                Text("insightPanelAddress：UIKit Insight 面板地址")
+                Text("insightRoutes.firstRoute：第一幕 WebProvider 签名 URL")
+                Text("insightRoutes.secondRoute：第二幕 iframe 签名 URL")
             }
         },
         confirmButton = {
-            Button(enabled = canSave, onClick = { onConfirm(scheme, host, port ?: target.port) }, colors = DialogButtonColors) { Text("保存") }
+            Button(
+                enabled = parsedSettings.isSuccess,
+                onClick = { parsedSettings.getOrNull()?.let(onConfirm) },
+                colors = DialogButtonColors
+            ) { Text("保存") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss, colors = DialogTextButtonColors) { Text("取消") }
