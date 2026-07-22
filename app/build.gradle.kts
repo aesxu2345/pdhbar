@@ -84,6 +84,8 @@ dependencies {
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
     implementation(libs.google.mlkit.barcode.scanning)
+    implementation(libs.coil.compose)
+    implementation(libs.coil.network.okhttp)
     // Local UIKit AAR
     implementation("org.mozilla.geckoview:geckoview:152.0.20260713164047")
     implementation(files("libs/UIKitInsight-release.aar"))

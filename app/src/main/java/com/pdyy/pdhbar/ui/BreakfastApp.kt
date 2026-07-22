@@ -62,7 +62,7 @@ fun BreakfastApp() {
                 fontWeight = FontWeight.Bold
             )
             Text(
-                text = "PDA 扫描导检单条码后，经 PipeFall 异步进入 Worker 处理。",
+                text = "PDA 扫描订单号后，经 PipeFall 异步进入 Worker 处理。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -80,7 +80,7 @@ fun BreakfastApp() {
                         onValueChange = { orderCode = it },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
-                        label = { Text("导检单条码 / order_code") }
+                        label = { Text("订单号 / order_code") }
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Button(onClick = { std.run().uifurge.onScanInput(orderCode) }) {
@@ -135,7 +135,7 @@ private fun CustomerDialog(
         title = { Text("客户早餐信息") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("导检单：${customer.orderCode}")
+                Text("订单号：${customer.orderCode}")
                 Text("姓名：${customer.name}")
                 Text("套餐：${customer.packageName ?: "-"}")
                 Text("早餐状态：${if (customer.hasBreakfast) "已登记" else "未登记"}")

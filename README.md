@@ -61,14 +61,14 @@ The response is expected to contain a payload similar to:
 ```
 
 ### Photo contract
-- `avatar_b64` is the preferred photo field for the approval dialog.
-- The value must be a pure Base64 JPEG payload without a `data:image/...` prefix.
-- The decoded image must be strictly `358 × 441` pixels.
-- If `avatar_b64` is invalid, empty, or not the required size, the dialog shows a placeholder instead of blocking the UI.
-- `avatar_url` remains a reserved field for future expansion; the current client does not load images from it.
-- When both fields are present, `avatar_b64` takes precedence.
+- `avatar_b64` and `avatar_url` are both optional; neither field is required for a successful customer response.
+- `avatar_b64` is temporarily bypassed: the current client neither parses nor displays it.
+- The approval dialog currently loads photos only from `avatar_url`.
+- Absolute HTTP(S) URLs are used directly. Relative URLs are resolved against the backend scheme, host, and port used for the customer query.
+- A missing, invalid, unreachable, or non-image URL leaves the fixed placeholder visible.
+- Missing or failed photo data does not prevent the remaining customer fields from being parsed and displayed independently.
 
 ### UI behavior
-- The approval dialog shows a fixed-size photo placeholder immediately while the photo is being decoded.
-- A new scan cancels the previous photo-loading work so stale photo results do not appear for the next customer.
+- The approval dialog and all customer fields appear immediately with a fixed-size photo placeholder; `avatar_url` loads independently and may finish later.
+- A new scan replaces the customer model and cancels the previous URL image request so stale photo results do not appear for the next customer.
 - The client uses `allow_breakfast` and `breakfast_status` as the business gating inputs; `has_breakfast` is treated as informational only.

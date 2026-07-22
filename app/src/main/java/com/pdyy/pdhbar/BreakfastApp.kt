@@ -5,8 +5,6 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.media.MediaPlayer
 import android.os.Build
 import android.os.Handler
@@ -16,7 +14,6 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
-import android.util.Base64
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.Toast
@@ -38,7 +35,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -89,7 +85,6 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shape
@@ -103,6 +98,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import coil3.compose.SubcomposeAsyncImage
+import coil3.compose.SubcomposeAsyncImageContent
 import com.pdyy.pdhbar.runtime.IPv4Address
 import com.pdyy.pdhbar.runtime.NetRoute
 import com.pdyy.pdhbar.runtime.PipeFallIO
@@ -115,9 +112,7 @@ import com.uikit.insight.UIEventStruct
 import com.uikit.insight.UIInsightCss
 import com.uikit.insight.UIInsightPlayConfig
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import org.json.JSONException
 import org.json.JSONObject
 import java.util.concurrent.Executors
@@ -1176,7 +1171,7 @@ private fun ManualInputDialog(
                 value = value,
                 onValueChange = onValueChange,
                 singleLine = true,
-                label = { Text("导检单条码 / order_code") }
+                label = { Text("订单号 / order_code") }
             )
         },
         confirmButton = {
@@ -1311,11 +1306,10 @@ private fun CustomerDialog(
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 CustomerPhoto(
                     orderCode = customer.orderCode,
-                    avatarBase64 = customer.avatarBase64,
                     avatarUrl = customer.avatarUrl,
                     querying = customer.querying
                 )
-                Text("导检单：${customer.orderCode}")
+                Text("订单号：${customer.orderCode}")
                 Text("姓名：${customer.name}")
                 Text("套餐：${customer.packageName ?: "-"}")
                 Text("早餐状态：${if (customer.querying) "N/A 查询中" else if (customer.hasBreakfast) "已登记" else "未登记"}")
@@ -1340,24 +1334,9 @@ private fun CustomerDialog(
 @Composable
 private fun CustomerPhoto(
     orderCode: String,
-    avatarBase64: String?,
     avatarUrl: String?,
     querying: Boolean
 ) {
-    var bitmap by remember(orderCode, avatarBase64) { mutableStateOf<Bitmap?>(null) }
-    var loading by remember(orderCode, avatarBase64) { mutableStateOf(!querying && avatarBase64 != null) }
-
-    LaunchedEffect(orderCode, avatarBase64) {
-        bitmap = null
-        loading = !querying && avatarBase64 != null
-        if (avatarBase64 != null) {
-            bitmap = withContext(Dispatchers.Default) {
-                decodeStrictIdPhoto(avatarBase64)
-            }
-        }
-        loading = false
-    }
-
     Box(
         modifier = Modifier
             .width(98.dp)
@@ -1366,43 +1345,27 @@ private fun CustomerPhoto(
             .background(Color(0xFFE4ECE7)),
         contentAlignment = Alignment.Center
     ) {
-        val photo = bitmap
-        if (photo != null) {
-            Image(
-                bitmap = photo.asImageBitmap(),
+        when {
+            querying -> PhotoPlaceholder("照片加载中")
+            avatarUrl == null -> PhotoPlaceholder("暂无照片")
+            else -> SubcomposeAsyncImage(
+                model = avatarUrl,
                 contentDescription = "客户证件照",
                 modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop
-            )
-        } else {
-            Text(
-                text = when {
-                    querying || loading -> "照片加载中"
-                    avatarBase64 == null && avatarUrl != null -> "照片待扩展"
-                    else -> "暂无照片"
-                },
-                color = Color(0xFF52645A),
-                fontSize = 12.sp
+                contentScale = ContentScale.Crop,
+                loading = { PhotoPlaceholder("照片加载中") },
+                error = { PhotoPlaceholder("暂无照片") },
+                success = { SubcomposeAsyncImageContent() }
             )
         }
     }
 }
 
-private fun decodeStrictIdPhoto(encoded: String): Bitmap? {
-    return runCatching {
-        val bytes = Base64.decode(encoded, Base64.NO_WRAP)
-        require(bytes.size >= 4 &&
-            bytes[0] == 0xFF.toByte() && bytes[1] == 0xD8.toByte() &&
-            bytes[bytes.lastIndex - 1] == 0xFF.toByte() && bytes[bytes.lastIndex] == 0xD9.toByte()
-        ) { "avatar_b64 must be JPEG" }
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-        require(bounds.outMimeType == "image/jpeg") { "avatar_b64 must be JPEG" }
-        require(bounds.outWidth == IdPhotoWidthPx && bounds.outHeight == IdPhotoHeightPx) {
-            "avatar_b64 must be ${IdPhotoWidthPx}x${IdPhotoHeightPx}"
-        }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-    }.getOrNull()
+@Composable
+private fun PhotoPlaceholder(text: String) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Text(text = text, color = Color(0xFF52645A), fontSize = 12.sp)
+    }
 }
 
 @Composable

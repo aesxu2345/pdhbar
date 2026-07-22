@@ -17,6 +17,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -25,12 +26,14 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.URI
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Base64
@@ -744,6 +747,8 @@ abstract class OncePostmanAction : PostmanAction {
         done = true
         ok = try {
             runOnce()
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             msg = e.message
             false
@@ -776,6 +781,8 @@ class GetXwwwAction(
         while (attempt < 5 && !ok) {
             ok = try {
                 executeHttp("GET", requestUrl, target, null, ::setMessage)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 lastMessage = e.message ?: e.javaClass.simpleName
                 setMessage(lastMessage)
@@ -817,13 +824,18 @@ class PostJsonAction(
                 try {
                     val response = executeRawHttp11Post(target, body)
                     responseText = response.body
-                    val businessCode = Regex("\\\"code\\\"\\s*:\\s*(\\d+)").find(response.body)
-                        ?.groupValues
-                        ?.getOrNull(1)
-                        ?.toIntOrNull()
-                    val responseMessage = Regex("\\\"msg\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"").find(response.body)
-                        ?.groupValues
-                        ?.getOrNull(1)
+                    Log.i(
+                        RUNTIME_TAG,
+                        "post response url=${target.url()} attempt=${attempt + 1}/${maxRetry + 1} " +
+                            "http=${response.statusCode} body=${response.body}"
+                    )
+                    val responseJson = runCatching { JSONObject(response.body) }.getOrNull()
+                    val businessCode = responseJson
+                        ?.takeIf { it.has("code") && !it.isNull("code") }
+                        ?.optInt("code")
+                    val responseMessage = responseJson
+                        ?.optString("msg")
+                        ?.takeIf(String::isNotBlank)
 
                     val ok = response.statusCode in 200..299 && (businessCode == null || businessCode == 200)
                     if (ok) {
@@ -835,6 +847,11 @@ class PostJsonAction(
                     lastMessage = responseMessage ?: "HTTP ${response.statusCode}"
                     setMessage(lastMessage)
                     Log.w(RUNTIME_TAG, "post attempt failed ${attempt + 1}/${maxRetry + 1}: $lastMessage")
+                    if (response.statusCode in 400..499 || (businessCode != null && businessCode != 200)) {
+                        return@withContext false
+                    }
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     lastError = e
                     lastMessage = e.message ?: e.javaClass.simpleName
@@ -1165,7 +1182,7 @@ class PipeFall : PipeFallIO() {
 
     private fun startCustomerQuery(orderCode: String) {
         if (orderCode.isBlank()) {
-            writeCommand(UiCommand.Toast("导检单条码不能为空"))
+            writeCommand(UiCommand.Toast("订单号不能为空"))
             return
         }
 
@@ -1191,7 +1208,8 @@ class PipeFall : PipeFallIO() {
         try {
             val runtime = std.run()
             runtime.api.onupdate(this)
-            Log.d(RUNTIME_TAG, "query customer: orderCode=$orderCode target=${runtime.api.target.url()}")
+            val queryTarget = runtime.api.target
+            Log.d(RUNTIME_TAG, "query customer: orderCode=$orderCode target=${queryTarget.url()}")
             val action = runtime.api.post(
                 mapOf(
                     "order_code" to orderCode,
@@ -1217,6 +1235,11 @@ class PipeFall : PipeFallIO() {
             }
             if (!isCurrentCustomerQuery(requestSequence)) return
             val blockReason = breakfastRight.blockReason()
+            val resolvedAvatarUrl = queryTarget.resolveResourceUrl(breakfastRight.avatarUrl)
+            Log.i(
+                RUNTIME_TAG,
+                "customer avatar_url raw=${breakfastRight.avatarUrl} resolved=$resolvedAvatarUrl"
+            )
             if (blockReason == null) {
                 blockedBreakfastOrders.remove(breakfastRight.orderCode)
             } else {
@@ -1230,8 +1253,8 @@ class PipeFall : PipeFallIO() {
                     name = breakfastRight.name,
                     sex = breakfastRight.sex,
                     phone = breakfastRight.phone,
-                    avatarBase64 = breakfastRight.avatarBase64,
-                    avatarUrl = breakfastRight.avatarUrl,
+                    avatarBase64 = null,
+                    avatarUrl = resolvedAvatarUrl,
                     birthDate = breakfastRight.birthDate,
                     packageName = breakfastRight.packageName,
                     hasBreakfast = breakfastRight.hasBreakfast,
@@ -1258,7 +1281,7 @@ class PipeFall : PipeFallIO() {
         failMessage: String
     ) {
         if (orderCode.isBlank()) {
-            writeCommand(UiCommand.Toast("导检单条码不能为空"))
+            writeCommand(UiCommand.Toast("订单号不能为空"))
             return
         }
 
@@ -1311,7 +1334,6 @@ private data class BreakfastRightView(
     val name: String,
     val sex: String?,
     val phone: String?,
-    val avatarBase64: String?,
     val avatarUrl: String?,
     val birthDate: String?,
     val packageName: String?,
@@ -1470,22 +1492,29 @@ private fun ByteArray.indexOfHeaderEnd(): Int {
 
 private fun parseBreakfastRight(json: String): BreakfastRightView? {
     val orderCode = json.stringField("order_code") ?: return null
-    val avatarBase64 = json.nullableStringField("avatar_b64")
     val avatarUrl = json.nullableStringField("avatar_url")
-    if (avatarBase64 == null && avatarUrl == null) return null
     return BreakfastRightView(
         orderCode = orderCode,
         cardNo = json.nullableStringField("card_no"),
         name = json.base64Field("name_b64") ?: "未知客户",
         sex = json.base64Field("sex_b64"),
         phone = json.nullableStringField("phone"),
-        avatarBase64 = avatarBase64,
         avatarUrl = avatarUrl,
         birthDate = json.nullableStringField("birth_date"),
         packageName = json.base64Field("package_name_b64"),
         hasBreakfast = json.booleanField("has_breakfast") ?: false,
         allowBreakfast = json.booleanField("allow_breakfast") ?: false
     )
+}
+
+private fun NetTarget.resolveResourceUrl(value: String?): String? {
+    val candidate = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    return runCatching {
+        val resolved = URI("$scheme://$host:$port/").resolve(candidate)
+        resolved.toString().takeIf { resolved.scheme.equals("http", ignoreCase = true) ||
+            resolved.scheme.equals("https", ignoreCase = true)
+        }
+    }.getOrNull()
 }
 
 private fun String.stringField(name: String): String? {
@@ -1535,5 +1564,5 @@ private fun String.jsonEscape(): String {
 }
 
 private fun String.jsonUnescape(): String {
-    return replace("\\\"", "\"").replace("\\\\", "\\")
+    return replace("\\/", "/").replace("\\\"", "\"").replace("\\\\", "\\")
 }
