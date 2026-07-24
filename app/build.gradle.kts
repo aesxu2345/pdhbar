@@ -6,21 +6,21 @@ plugins {
 }
 
 val verifyUIKitInsightAar by tasks.registering {
-    val aar = layout.projectDirectory.file("libs/UIKitInsight-release.aar")
-    val checksums = layout.projectDirectory.file("libs/ARTIFACTS.sha256")
+    val aar = rootProject.layout.projectDirectory.file("uikit/UIKitInsight-release.aar")
+    val checksums = rootProject.layout.projectDirectory.file("uikit/SHA256SUMS")
     inputs.file(aar)
     inputs.file(checksums)
 
     doLast {
         val expected = checksums.asFile.readLines()
-            .first { it.trim().endsWith("UIKitInsight-release.aar") }
+            .first { it.trim().endsWith("uikit/UIKitInsight-release.aar") }
             .trim()
             .split(Regex("\\s+"), limit = 2)
             .first()
         val digest = MessageDigest.getInstance("SHA-256")
         val actual = digest.digest(aar.asFile.readBytes()).joinToString("") { "%02x".format(it) }
         check(actual == expected) {
-            "UIKitInsight AAR 校验失败：期望 $expected，实际 $actual。请将新版 AAR 集成到 app/libs 并更新 ARTIFACTS.sha256。"
+            "UIKitInsight AAR 校验失败：期望 $expected，实际 $actual。请更新 uikit 制品及 SHA256SUMS。"
         }
     }
 }
@@ -86,9 +86,9 @@ dependencies {
     implementation(libs.google.mlkit.barcode.scanning)
     implementation(libs.coil.compose)
     implementation(libs.coil.network.okhttp)
-    // Local UIKit AAR
+    // Versioned local UIKit AAR and its integration guide live together under /uikit.
     implementation("org.mozilla.geckoview:geckoview:152.0.20260713164047")
-    implementation(files("libs/UIKitInsight-release.aar"))
+    implementation(files(rootProject.file("uikit/UIKitInsight-release.aar")))
     coreLibraryDesugaring(libs.desugar.jdk.libs)
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

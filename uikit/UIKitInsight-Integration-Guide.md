@@ -1,27 +1,32 @@
 # UIKitInsight AAR 接入文档
 
-构建日期：2026-07-14
+构建日期：2026-07-23
 
 ## 1. 环境要求
 
 - Android `compileSdk`: **36.1**
-- Android `minSdk`: 24
-- Java: 11 或更高
+- Android `minSdk`: 26
+- Java: 17 或更高
 - WebView 必须允许 JavaScript（SDK 默认创建的 WebView 已启用）
 - 宿主需要网络权限；AAR 会声明 `android.permission.INTERNET` 供 manifest 合并
 
 ## 2. 引入 AAR
 
-将 `UIKitInsight-release.aar` 放入应用模块的 `libs/` 目录，然后配置：
+将 `UIKitInsight-release.aar` 放入应用模块的 `libs/` 目录。第二幕使用 GeckoView，宿主必须同时加入 Mozilla Maven 仓库和与 AAR 匹配的 GeckoView 版本：
 
 ```kotlin
+repositories {
+    maven("https://maven.mozilla.org/maven2/")
+}
+
 dependencies {
     implementation(files("libs/UIKitInsight-release.aar"))
     implementation("org.jetbrains.kotlin:kotlin-stdlib:2.2.10")
+    implementation("org.mozilla.geckoview:geckoview:152.0.20260713164047")
 }
 ```
 
-UIKitInsight 自身不要求 Compose，也不会把宿主应用升级到 API 37。
+GeckoView 由 AAR 以 `compileOnly` 引用，不会被打包进 `UIKitInsight-release.aar`，宿主漏加该依赖会在运行第二幕时缺少类。UIKitInsight 自身不要求 Compose，也不会把宿主应用升级到 API 37。
 
 ## 3. 创建配置
 
@@ -89,6 +94,8 @@ NewUIInsightPlay insight = NewInsightKt.NewInsight(
 
 `NewInsight(...)` 返回的缓冲区包含 `ip`、处理后的 `firstRoute`、`secondRoute`、`bypass`、CSS 配置、WebView creator 和已初始化的 `UIEvent` 空事件结构。`bypass=false` 时，初始化阶段会用 AAR 内置的 `route-public.pem` 公钥等价内容分别验证两个签名路由，并为第一幕路由补全 `/provider`。除提取 nonce/signature 所需的前两段路径外，SDK 不再叠加 scheme、host、字符正则或路径总段数检查，路由保护只有 RSA 验签一层。`bypass=true` 时只检查路由字符串非空，随后原样交给网络栈；不解析 URL 结构、不解析 `/<nonce>/<signature>`、不执行 RSA 验签，也不改写第一幕路径、查询参数或 fragment。空路由或真实验签失败会被拒绝加载，但不会抛出异常导致宿主 Activity 或 Compose 首帧崩溃；WebView 创建时会用 Toast 提示初始化错误，原因同时记录在 Logcat 的 `UIKitInsight` 标签下。
 
+### 4.1 第一幕 firstRoute 数据
+
 第一幕会在原生后台线程读取 `/provider` 返回的三元素 JSON 数组，再异步回灌 WebView，不会阻塞首屏触摸。用户可在标题下方切换 `今日`、`本月`、`今年`；客户端通过 `period` 字段匹配数据，不依赖数组顺序：
 
 ```json
@@ -100,6 +107,37 @@ NewUIInsightPlay insight = NewInsightKt.NewInsight(
 ```
 
 数组必须各包含一条 `day`、`month`、`year` 记录，且三条记录的数量、总数和百分比必须完整、非负并彼此一致。SDK 原子接收整组数据：任意记录缺失、重复或字段无效时，不使用其它周期、旧单对象或内置示例补位，三个周期全部显示 `N/A`，图例保持 `0 / 0`，环形本体固定以 1% 状态保留可见。等待期间、路由无效、HTTP 非成功状态或读取失败时同样进入该状态。
+
+### 4.2 已扫码未登记状态 scan2fail
+
+`NewUIInsightPlay` 生命周期内持有一个以公开基类 `Scan2Fail` 暴露、由内部可变实现承载的 `scan2fail` 状态对象。宿主不能直接改写对象，只能通过 `fix2fail(int value)` 更新“已扫码未登记”数量；`getScan2fail().getValue()` 用于读取当前值。
+
+| API / 值 | 行为 |
+| --- | --- |
+| `fix2fail(value > 0)` | 显示橙色环形区段、第三行图例和 leader line 百分比 |
+| `fix2fail(0)` | 清零并隐藏橙色状态，恢复 firstRoute 的两段图表 |
+| `fix2fail(value < 0)` | 拒绝无效数量并抛出 `IllegalArgumentException`，原状态不变 |
+| `getScan2fail().getValue()` | 读取当前已扫码未登记数量 |
+| `Destory()` / `Destroy()` | 销毁状态对象；之后再次调用 `fix2fail()` 会抛出 `IllegalStateException` |
+
+```java
+NewUIInsightPlay insight = NewInsightKt.NewInsight(config, css);
+insight.fix2fail(3);
+int current = insight.getScan2fail().getValue();
+```
+
+`fix2fail()` 可在 `Display()` 前设置初值，也可在显示期间由业务事件动态调用；方法会安全地把更新投递给壳 WebView。它返回当前 `NewUIInsightPlay`，因此支持 `insight.fix2fail(3).Display(this)` 形式的链式调用。firstRoute 每 10 秒刷新时不会清空该值，切换今日、本月、今年时也使用同一个运行期值。
+
+`scan2fail` 是 firstRoute 之外的第三个独立计数。服务端返回的 `completed.count`、`pending.count` 和 `total` 不会被改写，展示公式为：
+
+```text
+displayTotal      = firstRoute.total + scan2fail
+completedPercent  = completed.count / displayTotal * 100
+pendingPercent    = pending.count / displayTotal * 100
+scan2failPercent  = scan2fail / displayTotal * 100
+```
+
+例如 firstRoute 为已完成 `5`、剩余 `2`，再调用 `fix2fail(1)`，第一幕会展示 `62.5% / 25.0% / 12.5%`，而不是继续使用服务端原来的 `71.4% / 28.6%`。没有有效 firstRoute 数据时仍保持原有 `N/A` 与 1% 占位环，不用虚构数据计算橙色占比；待后续轮询取得完整数据后，已保存的 `scan2fail` 会自动参与重算。
 
 第一路由在首屏加载后每 10 秒重新请求一次。刷新请求开始时保留当前画面，成功且三周期数据完整时一次性替换；HTTP 非成功状态、网络异常或响应数据无效时切换到上述 `N/A` 状态。Toast 判据不是路由能否 ping 通或是否返回 HTTP 200，而是本轮是否捕获到完整且一致的 `day/month/year` 有效数据；连续 10 轮未获得有效数据后仅提示一次，后续仍继续数据轮询以便服务恢复，但不会重复提示。任意一轮捕获到有效数据都会在提示触发前清零连续失败计数。
 
@@ -180,7 +218,7 @@ insight.OnClickUIEvent(new UIEventStruct() {
 insight.Display(this);
 ```
 
-`Display(Activity)` 会调用 `Activity.setContentView(WebView)`，强制使用 UIKitInsight 覆盖 Activity 当前显示的 XML、Compose 或其他 View。
+`Display(Activity)` 会创建同时容纳壳 WebView 与 GeckoView 的原生容器，再调用 `Activity.setContentView(...)` 覆盖 Activity 当前显示的 XML、Compose 或其他 View。
 
 非 Activity Context 必须提供容器：
 
@@ -188,7 +226,7 @@ insight.Display(this);
 insight.Display(context, container);
 ```
 
-如果 `context` 能解析到 Activity，即使同时传入 `container`，SDK 仍优先覆盖 Activity 根视图。
+显式传入 `container` 时 SDK 会将浏览器容器挂载到该 ViewGroup；只有未传容器且 `context` 能解析到 Activity 时，才覆盖 Activity 根视图。
 
 ## 7. 自定义 WebView Creator
 
@@ -225,6 +263,7 @@ protected void onDestroy() {
 - 移除 JavaScript Bridge；
 - 停止加载并清空历史；
 - 销毁 WebView；
+- 销毁 GeckoSession 与 `scan2fail` 状态；
 - 将 `UIEventStruct` 恢复为空占位结构。
 
 ## 9. 混淆
