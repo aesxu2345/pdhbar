@@ -62,6 +62,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -86,6 +87,7 @@ import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.StrokeCap
@@ -112,6 +114,7 @@ import com.uikit.insight.UIEventStruct
 import com.uikit.insight.UIInsightCss
 import com.uikit.insight.UIInsightPlayConfig
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
@@ -121,7 +124,6 @@ private val ScannerLineColor = Color(0xFF0A653A)
 private val ScannerIconLineColor = Color(0xFFF4FFF9)
 private val FlashlightGreen = ScannerLineColor
 private val GlassBlack = Color(0xD90A0B0F)
-private const val ScanRepeatDelayMs = 6_000L
 private const val APP_TAG = "BreakfastApp"
 private const val UiSettingsPrefsName = "breakfast_ui_settings"
 private const val IdPhotoWidthPx = 358
@@ -165,6 +167,17 @@ private fun createUIKitInsight(
     return insight
 }
 
+private fun applyUIKitWaitGroupCorrection(insight: NewUIInsightPlay, correctionValue: Int) {
+    runCatching {
+        insight.fix2fail(correctionValue.coerceAtLeast(0))
+        check(insight.scan2fail.value == correctionValue.coerceAtLeast(0)) {
+            "UIKit wait-group correction was not applied"
+        }
+    }.onFailure { error ->
+        Log.w(APP_TAG, "failed to apply UIKit wait-group correction", error)
+    }
+}
+
 private data class UiJsonSettings(
     val scheme: String,
     val host: String,
@@ -201,6 +214,19 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+独立许可组件 / Separately Licensed Component
+
+UIKitInsight / insight-board-kit
+项目来源：https://github.com/aesxu2345/insight-board-kit
+
+本应用内置的 UIKitInsight AAR 是带完整性校验的独立许可组件，不属于 pdhbar 的 MIT License 授权范围。
+制品在构建时通过 SHA-256 清单验证。其使用须符合以下任一许可：
+- PolyForm Free Trial License 1.0.0；或
+- 在有效 UIKitInsight Commercial Integration License 证书及其约定授权范围内使用。
+
+本声明不单独证明特定部署已经获得商业授权；商业使用资格以实际签发的有效证书、书面协议及其授权范围为准。
+完整条款请参阅随应用源码提供的 uikit/LICENSE、uikit/COMMERCIAL-INTEGRATION-LICENSE.md 与 uikit/NOTICE。
 
 Third-Party Notices
 
@@ -243,25 +269,22 @@ private val DialogTextButtonColors
         disabledContentColor = FlashlightGreen.copy(alpha = 0.45f)
     )
 
-private class ScannerThrottle<T>(
-    private val delayMs: Long,
-    private val action: (T) -> Unit
-) {
+private class ScannerGate<T>(private val action: (T) -> Unit) {
     private val handler = Handler(Looper.getMainLooper())
-    private var previous = 0L
+    @Volatile private var blocked = false
 
-    @Synchronized
     fun submit(value: T) {
-        val now = System.currentTimeMillis()
-        if (now - previous < delayMs) {
-            return
-        }
-        previous = now
-        handler.post { action(value) }
+        if (blocked) return
+        handler.post { if (!blocked) action(value) }
     }
 
-    @Synchronized
+    fun setBlocked(blocked: Boolean) {
+        this.blocked = blocked
+    }
+
     fun cancel() {
+        blocked = true
+        handler.removeCallbacksAndMessages(null)
     }
 }
 
@@ -398,6 +421,8 @@ fun BreakfastApp() {
     var backendDialogOpen by remember { mutableStateOf(false) }
     var licenseDialogOpen by remember { mutableStateOf(false) }
     var exitConfirmOpen by remember { mutableStateOf(false) }
+    var submittingBreakfast by remember { mutableStateOf(false) }
+    var queuedBreakfast by remember { mutableStateOf<UiCommand.BreakfastStatusQueued?>(null) }
     var uiLayerVisible by remember { mutableStateOf(true) }
     var manualCode by remember { mutableStateOf("") }
     var scannerGunMode by remember { mutableStateOf(std.run().scannerGunMode) }
@@ -409,10 +434,29 @@ fun BreakfastApp() {
         std.run().pipefall.commands.collect { command ->
             when (command) {
                 is UiCommand.Toast -> Toast.makeText(context, command.message, Toast.LENGTH_SHORT).show()
+                is UiCommand.SubmissionChanged -> {
+                    submittingBreakfast = command.submitting
+                    if (command.submitting) {
+                        customer = null
+                        manualInputOpen = false
+                        backendDialogOpen = false
+                        licenseDialogOpen = false
+                    }
+                }
+                is UiCommand.BreakfastStatusQueued -> {
+                    customer = null
+                    queuedBreakfast = command
+                }
                 is UiCommand.ShowCustomer -> customer = command
                 UiCommand.CloseDialog -> customer = null
             }
         }
+    }
+
+    LaunchedEffect(queuedBreakfast) {
+        val queued = queuedBreakfast ?: return@LaunchedEffect
+        delay(3_000L)
+        if (queuedBreakfast == queued) queuedBreakfast = null
     }
 
     Box(
@@ -424,6 +468,7 @@ fun BreakfastApp() {
         ScannerPreviewCard(
             modifier = Modifier.fillMaxSize(),
             scannerGunMode = scannerGunMode,
+            scanBlocked = submittingBreakfast,
             onBackToInsight = { uiLayerVisible = true },
             onScanned = { code ->
                 std.run().barscanner.onScan(code)
@@ -461,6 +506,36 @@ fun BreakfastApp() {
                 }
             )
         }
+        if (submittingBreakfast || queuedBreakfast != null) {
+            BackHandler(enabled = true) {}
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.68f))
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                awaitPointerEvent().changes.forEach { it.consume() }
+                            }
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    if (queuedBreakfast == null) {
+                        CircularProgressIndicator(color = Color.White)
+                        Text("正在加入后台队列…", color = Color.White, fontSize = 16.sp)
+                    } else {
+                        Text("✓", color = Color(0xFF7CFF9A), fontSize = 46.sp)
+                        Text(queuedBreakfast?.message.orEmpty(), color = Color.White, fontSize = 18.sp)
+                        Text("任务将在后台继续执行", color = Color.White.copy(alpha = 0.72f), fontSize = 14.sp)
+                    }
+                }
+            }
+        }
     }
 
     BackHandler(enabled = !uiLayerVisible && !exitConfirmOpen) {
@@ -470,8 +545,20 @@ fun BreakfastApp() {
     customer?.let { data ->
         CustomerDialog(
             customer = data,
-            onDone = { std.run().uifurge.onBreakfastDoneClick(data.orderCode) },
-            onCancelBreakfast = { std.run().uifurge.onBreakfastCancelClick(data.orderCode) },
+            onDone = {
+                if (data.querying) {
+                    std.run().uifurge.onBreakfastWaitClick(data.orderCode)
+                } else {
+                    std.run().uifurge.onBreakfastDoneClick(data.orderCode)
+                }
+            },
+            onCancelBreakfast = {
+                if (data.querying) {
+                    std.run().uifurge.onBreakfastCancelWaitClick(data.orderCode)
+                } else {
+                    std.run().uifurge.onBreakfastCancelClick(data.orderCode)
+                }
+            },
             onDismiss = {
                 customer = null
                 std.run().uifurge.onDialogCancelClick()
@@ -550,6 +637,7 @@ private fun UIKitInsightLayer(
     insightSecondRoute: String,
     onInsightCardNo: (String) -> Unit
 ) {
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val currentOnInsightCardNo by rememberUpdatedState(onInsightCardNo)
     val eventHandler = remember(
         onManualInputClick,
@@ -608,15 +696,25 @@ private fun UIKitInsightLayer(
         insight.OnCardNo.enroll(
             object : OnCardNo() {
                 override fun event(str: String) {
-                    str.takeIf(String::isNotBlank)?.let(currentOnInsightCardNo)
+                    str.takeIf(String::isNotBlank)?.let { cardNo ->
+                        mainHandler.post { currentOnInsightCardNo(cardNo) }
+                    }
                 }
             }
         )
         cardNoExecutor.execute { insight.OnCardNo.run() }
 
         onDispose {
-            insight.Destory()
+            insight.Destroy()
             cardNoExecutor.shutdownNow()
+        }
+    }
+
+    LaunchedEffect(insight) {
+        val waitGroup = std.run().waitgroup
+        applyUIKitWaitGroupCorrection(insight, waitGroup.len())
+        waitGroup.lenUpdates.collect { correctionValue ->
+            applyUIKitWaitGroupCorrection(insight, correctionValue)
         }
     }
 
@@ -628,6 +726,7 @@ private fun UIKitInsightLayer(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
+                applyUIKitWaitGroupCorrection(insight, std.run().waitgroup.len())
                 insight.Display(viewContext, this)
             }
         }
@@ -638,6 +737,7 @@ private fun UIKitInsightLayer(
 private fun ScannerPreviewCard(
     modifier: Modifier = Modifier,
     scannerGunMode: Boolean,
+    scanBlocked: Boolean,
     onBackToInsight: () -> Unit,
     onScanned: suspend (String) -> Unit,
     onPencilClick: () -> Unit
@@ -649,13 +749,16 @@ private fun ScannerPreviewCard(
     val scanPlayer = remember { MediaPlayer.create(context, R.raw.tingko) }
     val scannerGunFocusRequester = remember { FocusRequester() }
     var scannerGunText by remember { mutableStateOf("") }
-    val scanThrottle = remember {
-        ScannerThrottle<String>(ScanRepeatDelayMs) { result ->
+    val scanGate = remember {
+        ScannerGate<String> { result ->
             scope.launch {
                 onScanned(result)
                 scanFeedback(context, scanPlayer)
             }
         }
+    }
+    LaunchedEffect(scanBlocked) {
+        scanGate.setBlocked(scanBlocked)
     }
     val scanLineTransition = rememberInfiniteTransition(label = "scan-line")
     val scanLineAlpha by scanLineTransition.animateFloat(
@@ -686,7 +789,7 @@ private fun ScannerPreviewCard(
         if (scannerGunMode) {
             flashlightOn = false
             if (camera == null) {
-                std.run().attachScannerGunApi(context) { code -> scanThrottle.submit(code) }
+                std.run().attachScannerGunApi(context) { code -> scanGate.submit(code) }
                 scannerGunFocusRequester.requestFocus()
             } else {
                 camera = null
@@ -698,7 +801,7 @@ private fun ScannerPreviewCard(
                         }.onFailure {
                             Toast.makeText(context, "相机释放失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
                         }
-                        std.run().attachScannerGunApi(context) { code -> scanThrottle.submit(code) }
+                        std.run().attachScannerGunApi(context) { code -> scanGate.submit(code) }
                         scannerGunFocusRequester.requestFocus()
                     },
                     ContextCompat.getMainExecutor(context)
@@ -716,7 +819,7 @@ private fun ScannerPreviewCard(
         delay(260)
         if (scannerGunText.trim('\r', '\n', ' ', '\t') == code) {
             scannerGunText = ""
-            scanThrottle.submit(code)
+            scanGate.submit(code)
         }
     }
 
@@ -728,7 +831,7 @@ private fun ScannerPreviewCard(
 
     DisposableEffect(Unit) {
         onDispose {
-            scanThrottle.cancel()
+            scanGate.cancel()
             cameraExecutor.shutdown()
             scanPlayer.release()
         }
@@ -764,7 +867,7 @@ private fun ScannerPreviewCard(
                                         it.setAnalyzer(
                                             cameraExecutor,
                                             MLKitBarcodeAnalyzer { result ->
-                                                scanThrottle.submit(result)
+                                                scanGate.submit(result)
                                             }
                                         )
                                     }
@@ -838,7 +941,7 @@ private fun ScannerPreviewCard(
                         val code = value.trim('\r', '\n', ' ', '\t')
                         if (value.contains('\n') || value.contains('\r')) {
                             scannerGunText = ""
-                            if (code.isNotBlank()) scanThrottle.submit(code)
+                            if (code.isNotBlank()) scanGate.submit(code)
                         } else {
                             scannerGunText = value
                         }
@@ -1320,11 +1423,19 @@ private fun CustomerDialog(
             }
         },
         confirmButton = {
-            Button(enabled = !customer.querying && customer.blockReason == null, onClick = onDone, colors = DialogButtonColors) { Text("完成早餐") }
+            Button(
+                enabled = customer.querying || customer.blockReason == null,
+                onClick = onDone,
+                colors = DialogButtonColors
+            ) { Text(if (customer.querying) "后台审批" else "完成早餐") }
         },
         dismissButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(enabled = !customer.querying, onClick = onCancelBreakfast, colors = DialogTextButtonColors) { Text("取消登记") }
+                TextButton(
+                    enabled = true,
+                    onClick = onCancelBreakfast,
+                    colors = DialogTextButtonColors
+                ) { Text("取消登记") }
                 TextButton(onClick = onDismiss, colors = DialogTextButtonColors) { Text("关闭") }
             }
         }

@@ -19,7 +19,6 @@ import android.view.KeyEvent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -37,6 +36,7 @@ import java.net.URI
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
@@ -54,7 +54,6 @@ private const val DEFAULT_API_HOST = "172.16.203.56"
 private const val DEFAULT_API_PORT = 8088
 private const val RUNTIME_TAG = "BreakfastRuntime"
 const val SCAN_REPEAT_DELAY_MS = 1_200L
-private const val SCANNER_GUN_LAZY_REPEAT_DELAY_MS = 6_000L
 private const val SUNMI_SCANNER_SETTING_ACTION = "com.sunmi.scanner.ACTION_BAR_DEVICES_SETTING"
 private const val SUNMI_SCANNER_SERIAL_SETTING_ACTION = "com.sunmi.scanner.ACTION_SCANNER_SERIAL_SETTING"
 private const val SUNMI_SCANNER_SERIAL_OPEN_ACTION = "com.sunmi.scanner.serial_com4_open"
@@ -68,6 +67,7 @@ private const val SUNMI_SCANNER_SERVICE_CLASS = "com.sunmi.scanner.ScannerServic
 
 class std private constructor(
     val api: Postman,
+    val waitgroup: WaitGroupIO,
     val barscanner: BarScanner,
     val pipefall: PipeFallIO,
     systemIO: IBinder,
@@ -130,19 +130,27 @@ class std private constructor(
             val pipefall = PipeFall()
             val systemIO = OnBindSystemIO(pipefall)
             val api = Postman(target = target)
+            val waitgroup = WaitGroup(requireNotNull(context).applicationContext) { request ->
+                api.executeWaitGroupRequest(request)
+            }
+            pipefall.bindWaitGroup(waitgroup)
             val barscanner = NewBarScanner(api = api, pipefall = pipefall)
             val uifurge = UIfurge(pipefall = pipefall)
             val scannerGunApi = ScannerGunApiBridge()
 
             return std(
                 api = api,
+                waitgroup = waitgroup,
                 barscanner = barscanner,
                 pipefall = pipefall,
                 systemIO = systemIO,
                 uifurge = uifurge,
                 scannerGunApi = scannerGunApi,
                 scannerGunMode = sharedConfig.scannerGunMode
-            ).also { buffer = it }
+            ).also {
+                buffer = it
+                waitgroup.enroll()
+            }
         }
 
         fun run(): std = buffer ?: onCreate()
@@ -151,6 +159,11 @@ class std private constructor(
             if (!isCreated()) return
             context.applicationContext.writeApiTarget(run().api.target)
             context.applicationContext.writeRuntimeSharedConfig(RuntimeSharedConfig(run().scannerGunMode))
+            run().waitgroup.persist()
+        }
+
+        fun destroy() {
+            buffer?.waitgroup?.destroy()
         }
 
         fun attachSystemIO(binder: IBinder) {
@@ -175,8 +188,6 @@ class ScannerGunApiBridge {
     private var activeRuntime: std? = null
     private var configured = false
     private var lastTriggerAt = 0L
-    private var scanThrottlePrevious = 0L
-    private var scanThrottlePreviousCode = ""
     private val mainHandler = Handler(Looper.getMainLooper())
     private val keyBuffer = StringBuilder()
     private var keyBufferFlush: Runnable? = null
@@ -461,21 +472,7 @@ class ScannerGunApiBridge {
         callback?.invoke(code)
     }
 
-    @Synchronized
     private fun submitScannerGunCode(code: String) {
-        val now = SystemClock.elapsedRealtime()
-        val elapsed = now - scanThrottlePrevious
-
-        if (elapsed < SCANNER_GUN_LAZY_REPEAT_DELAY_MS) {
-            Log.d(
-                RUNTIME_TAG,
-                "scanner gun lazy drop code=${code.take(64)} same=${code == scanThrottlePreviousCode} elapsed=$elapsed"
-            )
-            return
-        }
-
-        scanThrottlePrevious = now
-        scanThrottlePreviousCode = code
         mainHandler.post { callback?.invoke(code) }
     }
 }
@@ -717,6 +714,43 @@ class Postman(
     private fun clearTemporaryFields() {
         dumpTemporaryFields()
     }
+
+    suspend fun executeWaitGroupRequest(request: WaitGroupRequest): WaitGroupExecutionResult {
+        return when (request.task) {
+            WaitGroupTask.QueryBreakfastRight -> {
+                val action = post(
+                    mapOf("order_code" to request.orderCode, "card_no" to null)
+                ) as PostJsonAction
+                action.Do()
+                WaitGroupExecutionResult(
+                    completed = action.ok,
+                    success = action.ok,
+                    responseText = action.responseText,
+                    message = action.msg
+                )
+            }
+            WaitGroupTask.Enroll, WaitGroupTask.CancelEnrollment -> {
+                val enroll = request.task == WaitGroupTask.Enroll
+                val action = get(
+                    mapOf(
+                        "order_code" to request.orderCode,
+                        "breakfast_status" to if (enroll) "1" else "0",
+                        "breakfast_remark" to if (enroll) {
+                            "PDA扫码核销早餐"
+                        } else {
+                            "PDA取消早餐核销"
+                        }
+                    )
+                )
+                action.Do()
+                WaitGroupExecutionResult(
+                    completed = action.ok,
+                    success = action.ok,
+                    message = action.msg
+                )
+            }
+        }
+    }
 }
 
 interface PostmanAction {
@@ -918,6 +952,14 @@ class UIfurge(
         push(Action.Button(id = "breakfast_done", value = orderCode.trim()))
     }
 
+    fun onBreakfastWaitClick(orderCode: String) {
+        push(Action.Button(id = "breakfast_wait", value = orderCode.trim()))
+    }
+
+    fun onBreakfastCancelWaitClick(orderCode: String) {
+        push(Action.Button(id = "breakfast_wait_cancel", value = orderCode.trim()))
+    }
+
     fun onBreakfastCancelClick(orderCode: String) {
         push(Action.Button(id = "breakfast_cancel", value = orderCode.trim()))
     }
@@ -987,6 +1029,8 @@ fun NewEventListener(action: Action): EventListenerBuffer {
 
         is Action.Button -> when (action.id) {
             "breakfast_done" -> UiEvent.BreakfastDone(action.value)
+            "breakfast_wait" -> UiEvent.BreakfastDone(action.value)
+            "breakfast_wait_cancel" -> UiEvent.BreakfastCancel(action.value)
             "breakfast_cancel" -> UiEvent.BreakfastCancel(action.value)
             "dialog_cancel" -> UiEvent.DialogCancel
             "pencil" -> null
@@ -1021,6 +1065,8 @@ sealed interface UiEvent {
 
 sealed interface UiCommand {
     data class Toast(val message: String) : UiCommand
+    data class SubmissionChanged(val submitting: Boolean) : UiCommand
+    data class BreakfastStatusQueued(val orderCode: String, val message: String) : UiCommand
     data class ShowCustomer(
         val orderCode: String,
         val cardNo: String?,
@@ -1068,6 +1114,11 @@ data class NetRoute(
 )
 
 class PipeFall : PipeFallIO() {
+    private sealed interface SubmissionState {
+        data object Idle : SubmissionState
+        data class Submitting(val orderCode: String, val status: String) : SubmissionState
+    }
+
     private val workerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val eventSocket = MutableSharedFlow<UiEvent>(extraBufferCapacity = 64)
@@ -1082,9 +1133,8 @@ class PipeFall : PipeFallIO() {
         private set
     override var latestNetRoute: NetRoute? = null
         private set
-    private var queryJob: Job? = null
-    private var querySequence = 0L
-    private val blockedBreakfastOrders = mutableMapOf<String, String>()
+    private var waitGroup: WaitGroupIO? = null
+    private val submissionState = AtomicReference<SubmissionState>(SubmissionState.Idle)
 
     init {
         workerScope.launch {
@@ -1098,7 +1148,35 @@ class PipeFall : PipeFallIO() {
         }
     }
 
+    fun bindWaitGroup(waitGroup: WaitGroupIO) {
+        this.waitGroup = waitGroup
+        workerScope.launch {
+            waitGroup.onwaitgroup.collect(::handleWaitGroupOutput)
+        }
+    }
+
     override fun writeEvent(event: UiEvent) {
+        if (event is UiEvent.ScanCode && submissionState.get() !is SubmissionState.Idle) {
+            Log.d(RUNTIME_TAG, "scan ignored while breakfast status is submitting")
+            return
+        }
+        if (event is UiEvent.BreakfastDone || event is UiEvent.BreakfastCancel) {
+            val orderCode = when (event) {
+                is UiEvent.BreakfastDone -> event.orderCode
+                is UiEvent.BreakfastCancel -> event.orderCode
+                else -> return
+            }
+            val status = if (event is UiEvent.BreakfastDone) "1" else "0"
+            if (!submissionState.compareAndSet(
+                    SubmissionState.Idle,
+                    SubmissionState.Submitting(orderCode, status)
+                )
+            ) {
+                Log.d(RUNTIME_TAG, "duplicate breakfast submission ignored: orderCode=$orderCode")
+                return
+            }
+            writeCommand(UiCommand.SubmissionChanged(true))
+        }
         if (event is UiEvent.ScanCode) {
             latestScanCode = ScanCodePayload(event.code)
             if (event.code.isNotBlank()) {
@@ -1124,6 +1202,10 @@ class PipeFall : PipeFallIO() {
         val emitted = eventSocket.tryEmit(event)
         Log.d(RUNTIME_TAG, "event emitted=$emitted event=$event")
         if (!emitted) {
+            if (event is UiEvent.BreakfastDone || event is UiEvent.BreakfastCancel) {
+                submissionState.set(SubmissionState.Idle)
+                writeCommand(UiCommand.SubmissionChanged(false))
+            }
             if (event is UiEvent.ScanCode) {
                 writeCommand(UiCommand.CloseDialog)
             }
@@ -1159,20 +1241,10 @@ class PipeFall : PipeFallIO() {
     private suspend fun handleEvent(event: UiEvent) {
         when (event) {
             is UiEvent.ScanCode -> startCustomerQuery(event.code)
-            is UiEvent.BreakfastDone -> changeBreakfastStatus(
-                orderCode = event.orderCode,
-                status = "1",
-                remark = "PDA扫码核销早餐",
-                successMessage = "早餐核销成功",
-                failMessage = "核销失败，已进入待重试队列"
-            )
-
-            is UiEvent.BreakfastCancel -> changeBreakfastStatus(
-                orderCode = event.orderCode,
-                status = "0",
-                remark = "PDA取消早餐核销",
-                successMessage = "已取消早餐核销",
-                failMessage = "取消早餐核销失败"
+            is UiEvent.BreakfastDone -> enqueueStatusChange(event.orderCode, WaitGroupTask.Enroll)
+            is UiEvent.BreakfastCancel -> enqueueStatusChange(
+                event.orderCode,
+                WaitGroupTask.CancelEnrollment
             )
 
             is UiEvent.ActionNotice -> writeCommand(UiCommand.Toast(event.message))
@@ -1186,129 +1258,88 @@ class PipeFall : PipeFallIO() {
             return
         }
 
-        val requestSequence = ++querySequence
-        queryJob?.cancel()
-        queryJob = workerScope.launch {
-            showCustomer(orderCode, requestSequence)
+        workerScope.launch {
+            waitGroup?.push(orderCode, WaitGroupTask.QueryBreakfastRight)
+                ?: writeCommand(UiCommand.Toast("任务队列尚未初始化"))
         }
     }
 
     private fun cancelCustomerQuery() {
-        querySequence += 1
         writeCommand(UiCommand.CloseDialog)
     }
 
-    private fun isCurrentCustomerQuery(requestSequence: Long): Boolean {
-        return requestSequence == querySequence
-    }
-
-    private suspend fun showCustomer(orderCode: String, requestSequence: Long) {
-        writeCommand(UiCommand.Toast("正在查询早餐权益..."))
-
-        try {
-            val runtime = std.run()
-            runtime.api.onupdate(this)
-            val queryTarget = runtime.api.target
-            Log.d(RUNTIME_TAG, "query customer: orderCode=$orderCode target=${queryTarget.url()}")
-            val action = runtime.api.post(
-                mapOf(
-                    "order_code" to orderCode,
-                    "card_no" to null
-                )
-            ).Do()
-
-            if (!isCurrentCustomerQuery(requestSequence)) return
-
-            if (action !is PostJsonAction || !action.ok) {
-                Log.w(RUNTIME_TAG, "query failed: ${action.msg}")
-                writeCommand(UiCommand.Toast(action.msg ?: "客户信息查询失败"))
-                writeCommand(UiCommand.CloseDialog)
-                return
-            }
-
-            Log.d(RUNTIME_TAG, "query response: ${action.responseText.take(300)}")
-            val breakfastRight = parseBreakfastRight(action.responseText)
-            if (breakfastRight == null) {
-                writeCommand(UiCommand.Toast("客户信息解析失败"))
-                writeCommand(UiCommand.CloseDialog)
-                return
-            }
-            if (!isCurrentCustomerQuery(requestSequence)) return
-            val blockReason = breakfastRight.blockReason()
-            val resolvedAvatarUrl = queryTarget.resolveResourceUrl(breakfastRight.avatarUrl)
-            Log.i(
-                RUNTIME_TAG,
-                "customer avatar_url raw=${breakfastRight.avatarUrl} resolved=$resolvedAvatarUrl"
-            )
-            if (blockReason == null) {
-                blockedBreakfastOrders.remove(breakfastRight.orderCode)
-            } else {
-                blockedBreakfastOrders[breakfastRight.orderCode] = blockReason
-            }
-
-            writeCommand(
-                UiCommand.ShowCustomer(
-                    orderCode = breakfastRight.orderCode,
-                    cardNo = breakfastRight.cardNo,
-                    name = breakfastRight.name,
-                    sex = breakfastRight.sex,
-                    phone = breakfastRight.phone,
-                    avatarBase64 = null,
-                    avatarUrl = resolvedAvatarUrl,
-                    birthDate = breakfastRight.birthDate,
-                    packageName = breakfastRight.packageName,
-                    hasBreakfast = breakfastRight.hasBreakfast,
-                    allowBreakfast = breakfastRight.allowBreakfast,
-                    blockReason = blockReason
-                )
-            )
-        } finally {
-            if (isCurrentCustomerQuery(requestSequence)) {
-                queryJob = null
-            }
-            Log.d(
-                RUNTIME_TAG,
-                "customer query finished: orderCode=$orderCode current=${isCurrentCustomerQuery(requestSequence)}"
-            )
-        }
-    }
-
-    private suspend fun changeBreakfastStatus(
-        orderCode: String,
-        status: String,
-        remark: String,
-        successMessage: String,
-        failMessage: String
-    ) {
+    private suspend fun enqueueStatusChange(orderCode: String, task: WaitGroupTask) {
         if (orderCode.isBlank()) {
-            writeCommand(UiCommand.Toast("订单号不能为空"))
+            finishSubmission("订单号不能为空")
             return
         }
+        val queue = waitGroup
+        if (queue == null) {
+            finishSubmission("任务队列尚未初始化")
+            return
+        }
+        queue.push(orderCode, task)
+        submissionState.set(SubmissionState.Idle)
+        writeCommand(UiCommand.SubmissionChanged(false))
+        writeCommand(
+            UiCommand.BreakfastStatusQueued(
+                orderCode,
+                if (task == WaitGroupTask.Enroll) "早餐核销已进入后台队列" else "取消登记已进入后台队列"
+            )
+        )
+    }
 
-        if (status == "1") {
-            val blockReason = blockedBreakfastOrders[orderCode]
-            if (blockReason != null) {
-                writeCommand(UiCommand.Toast(blockReason))
-                return
+    private fun handleWaitGroupOutput(output: WaitGroupOutput) {
+        when (output.request.task) {
+            WaitGroupTask.QueryBreakfastRight -> showCustomerFromQueue(output)
+            WaitGroupTask.Enroll, WaitGroupTask.CancelEnrollment -> {
+                if (output.outcome == WaitGroupOutcome.Completed) {
+                    writeCommand(UiCommand.Toast(if (output.request.task == WaitGroupTask.Enroll) {
+                        "早餐核销成功"
+                    } else {
+                        "已取消早餐核销"
+                    }))
+                } else {
+                    writeCommand(UiCommand.Toast(output.result.message ?: "早餐状态提交失败"))
+                }
             }
         }
+    }
 
-        writeCommand(UiCommand.CloseDialog)
-        writeCommand(UiCommand.Toast("正在提交早餐状态..."))
-
-        val action = std.run().api.get(
-            mapOf(
-                "order_code" to orderCode,
-                "breakfast_status" to status,
-                "breakfast_remark" to remark
-            )
-        ).Do()
-
-        if (action.ok) {
-            writeCommand(UiCommand.Toast(successMessage))
-        } else {
-            writeCommand(UiCommand.Toast(action.msg ?: failMessage))
+    private fun showCustomerFromQueue(output: WaitGroupOutput) {
+        if (output.outcome != WaitGroupOutcome.Completed) {
+            writeCommand(UiCommand.Toast(output.result.message ?: "客户信息查询失败"))
+            return
         }
+        val breakfastRight = output.result.responseText?.let(::parseBreakfastRight)
+        if (breakfastRight == null) {
+            writeCommand(UiCommand.Toast("客户信息解析失败"))
+            return
+        }
+        val blockReason = breakfastRight.blockReason()
+        val resolvedAvatarUrl = std.run().api.target.resolveResourceUrl(breakfastRight.avatarUrl)
+        writeCommand(
+            UiCommand.ShowCustomer(
+                orderCode = breakfastRight.orderCode,
+                cardNo = breakfastRight.cardNo,
+                name = breakfastRight.name,
+                sex = breakfastRight.sex,
+                phone = breakfastRight.phone,
+                avatarBase64 = null,
+                avatarUrl = resolvedAvatarUrl,
+                birthDate = breakfastRight.birthDate,
+                packageName = breakfastRight.packageName,
+                hasBreakfast = breakfastRight.hasBreakfast,
+                allowBreakfast = breakfastRight.allowBreakfast,
+                blockReason = blockReason
+            )
+        )
+    }
+
+    private fun finishSubmission(message: String) {
+        submissionState.set(SubmissionState.Idle)
+        writeCommand(UiCommand.SubmissionChanged(false))
+        writeCommand(UiCommand.Toast(message))
     }
 }
 
@@ -1342,8 +1373,8 @@ private data class BreakfastRightView(
 )
 
 private fun BreakfastRightView.blockReason(): String? {
-    if (hasBreakfast && allowBreakfast) return null
-    return "无早餐权益：has_breakfast=$hasBreakfast, allow_breakfast=$allowBreakfast"
+    if (allowBreakfast) return null
+    return "无早餐权益：allow_breakfast=false"
 }
 
 private fun executeHttp(

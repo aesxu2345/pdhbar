@@ -3,6 +3,7 @@ classDiagram
 
     class std {
         +Postman api
+        +WaitGroupIO waitgroup
         +BarScanner barscanner
         +PipeFallIO pipefall
         +IBinder systemIO
@@ -15,6 +16,41 @@ classDiagram
         +NetTarget target
         +get()
         +post()
+        +probeBreakfastApproval()
+    }
+
+    class WaitGroupIO {
+        <<interface>>
+        +onwaitgroup
+        +push(orderCode, approvalState, task)
+        +enroll()
+        +persist()
+        +destroy()
+    }
+
+    class WaitGroup {
+        -Node current 遍历游标
+        -int size
+        -long revision
+        +push()
+        +enroll()
+        -insertOrCompact()
+        -remove()
+    }
+
+    class WaitGroupNode {
+        -id
+        -orderCode
+        -task 登记或取消登记
+        -state 0..2
+        -createdAtEpochMs
+        -Node next
+    }
+
+    class WaitGroupTask {
+        <<enumeration>>
+        Enroll
+        CancelEnrollment
     }
 
     class NetTarget {
@@ -62,6 +98,7 @@ classDiagram
     }
 
     std *-- Postman : 封装 api
+    std *-- WaitGroupIO : 封装持久化缓冲
     std *-- BarScanner : 封装 scanner
     std *-- UIfurge : 封装 ui
     std *-- PipeFallIO : 封装 pipe
@@ -69,6 +106,10 @@ classDiagram
 
     Postman *-- NetTarget : 封装目标地址
     Postman ..> PostmanAction : 创建一次性动作
+    WaitGroup --|> WaitGroupIO : 实现
+    WaitGroup *-- WaitGroupNode : 环形链表
+    WaitGroupNode --> WaitGroupTask : 任务类型
+    WaitGroup ..> Postman : 状态2审批探针
 
     NewBarScanner ..> BarScanner : 工厂创建
 

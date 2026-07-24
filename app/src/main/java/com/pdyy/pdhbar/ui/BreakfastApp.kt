@@ -42,6 +42,11 @@ fun BreakfastApp() {
         std.run().pipefall.commands.collect { command ->
             when (command) {
                 is UiCommand.Toast -> Toast.makeText(context, command.message, Toast.LENGTH_SHORT).show()
+                is UiCommand.SubmissionChanged -> Unit
+                is UiCommand.BreakfastStatusQueued -> {
+                    Toast.makeText(context, command.message, Toast.LENGTH_SHORT).show()
+                    customer = null
+                }
                 is UiCommand.ShowCustomer -> customer = command
                 UiCommand.CloseDialog -> customer = null
             }

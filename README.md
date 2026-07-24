@@ -1,4 +1,14 @@
 # pdhbar
+
+## WaitGroup 缓冲
+
+- 客户权益查询从扫码入口直接进入持久化 WaitGroup，审核弹窗先显示 `N/A 查询中`，再由队列结果更新。
+- WaitGroup 使用单向环形链表；`current` 只是遍历游标，不表示栈顶或队头。
+- 普通扫码允许同一订单重复进入查询流程，不在业务扫码入口按订单号去重。
+- 去重仅发生在 WaitGroup 内：同订单多个登记任务只保留一个；只要存在取消登记任务，就只保留一个取消登记节点并摘除该订单的其他节点。
+- 节点保存权益审批状态、任务类型和创建时间：`0` 为无权益并拦截所有后续 GET，`1` 为有权益并直接执行 GET，`2` 为未定态并由 WaitGroup 先 POST 查询、转成 `0/1` 后再决定是否执行 GET。
+- 查询弹窗仍处于 `N/A` 时点击“完成早餐”，登记任务以未定态 `2` 入队；已查询到无权益时“完成早餐”变灰，但“取消登记”仍可入队，并由状态 `0` 在队列执行层拦截。
+- UIKit 创建后会在 `Display` 前调用 `fix2fail(len)`，并持续订阅长度变化，将环形链表当前节点数作为“已扫码未登记”修正值。
 a MIT based tample for sunmi PDAs
 
 ## Licensing
@@ -72,3 +82,5 @@ The response is expected to contain a payload similar to:
 - The approval dialog and all customer fields appear immediately with a fixed-size photo placeholder; `avatar_url` loads independently and may finish later.
 - A new scan replaces the customer model and cancels the previous URL image request so stale photo results do not appear for the next customer.
 - The client uses `allow_breakfast` and `breakfast_status` as the business gating inputs; `has_breakfast` is treated as informational only.
+- After either breakfast action is queued, the approval dialog closes immediately and a fixed three-second visual confirmation is shown while network execution continues in the background.
+- Scans may repeat normally; equivalent pending work is compacted only inside WaitGroup.

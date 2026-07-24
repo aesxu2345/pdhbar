@@ -158,3 +158,5 @@ data class BreakfastRightData(
 前端只展示原因，不拆业务。
 前端只根据 allow_breakfast 决定按钮能不能点。
 审批弹窗和客户基础信息立即显示，固定尺寸照片占位框独立异步加载 avatar_url；新扫码会取消上一客户的照片任务。
+点击“完成早餐”或“取消登记”后任务立即进入 WaitGroup，审核弹窗关闭并显示固定 3 秒视觉确认；网络请求继续在后台执行和重试。
+普通扫码允许重复；仅 WaitGroup 内压缩等价待处理任务。has_breakfast 仅展示，不参与拦截。

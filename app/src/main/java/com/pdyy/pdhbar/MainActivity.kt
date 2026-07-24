@@ -76,6 +76,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         std.save(applicationContext)
+        std.destroy()
         std.run().barscanner.destroy()
         if (systemIOBound) {
             unbindService(systemIOConnection)
