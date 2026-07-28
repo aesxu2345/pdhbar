@@ -8,7 +8,7 @@
 - 去重仅发生在 WaitGroup 内：同订单多个登记任务只保留一个；只要存在取消登记任务，就只保留一个取消登记节点并摘除该订单的其他节点。
 - 节点保存权益审批状态、任务类型和创建时间：`0` 为无权益并拦截所有后续 GET，`1` 为有权益并直接执行 GET，`2` 为未定态并由 WaitGroup 先 POST 查询、转成 `0/1` 后再决定是否执行 GET。
 - 查询弹窗仍处于 `N/A` 时点击“完成早餐”，登记任务以未定态 `2` 入队；已查询到无权益时“完成早餐”变灰，但“取消登记”仍可入队，并由状态 `0` 在队列执行层拦截。
-- UIKit 创建后会在 `Display` 前调用 `fix2fail(len)`，并持续订阅长度变化，将环形链表当前节点数作为“已扫码未登记”修正值。
+- UIKit 使用 `app/libs/UIKitInsight-release.aar` 提供的当前公开接口完成显示、侧栏事件和卡号监听。
 a MIT based tample for sunmi PDAs
 
 ## Licensing
@@ -28,10 +28,10 @@ It is not covered by pdhbar's MIT License. See:
 
 The client currently calls POST /query_breakfast_right with a JSON body shaped like this:
 
-```json
+```jsonc
 {
-  "order_code": "T202607010001",
-  "card_no": null
+  "order_code": "T202607010001", // 必填：订单号或导检单条码
+  "card_no": null // 可选：卡号
 }
 ```
 
@@ -48,32 +48,39 @@ The request is treated as successful when:
 ### Response fields
 The response is expected to contain a payload similar to:
 
-```json
+```jsonc
 {
-  "code": 200,
-  "msg": "ok",
+  "code": 200, // 业务状态码
+  "msg": "ok", // 业务消息
   "data": {
-    "order_code": "T202607010001",
-    "card_no": "123456",
-    "name_b64": "5byg5LiJ",
-    "sex_b64": "55S3",
-    "phone": "138****8888",
-    "avatar_b64": "<base64 of a 358x441 JPEG>",
-    "avatar_url": "",
-    "birth_date": "1990-01-01",
-    "package_name_b64": "5L2T5qOA5aWX6aSQ",
-    "has_breakfast": true,
-    "allow_breakfast": true,
-    "breakfast_status": 0,
-    "reason_b64": ""
+    "order_code": "T202607010001", // 必填：订单号
+    "card_no": "123456", // 可选：卡号
+    "name_b64": "5byg5LiJ", // 姓名，UTF-8 Base64
+    "sex_b64": "55S3", // 性别，UTF-8 Base64
+    "phone": "138****8888", // 手机号
+    "avatar_url": "", // 可选：头像 URL
+    "birth_date": "1990-01-01", // 出生日期
+    "package_name_b64": "5L2T5qOA5aWX6aSQ", // 套餐名称，UTF-8 Base64
+    "exam_type_b64": "5YWl6IGM5L2T5qOA", // 可选：体检类型，UTF-8 Base64
+    "organization_name_b64": "5p+Q5p+Q5YWs5Y+4", // 可选：单位名称，UTF-8 Base64
+    "exam_total_price": "680.00", // 可选：体检总价字符串，不使用浮点数
+    "has_breakfast": true, // 展示字段
+    "allow_breakfast": true, // 早餐权益判定字段
+    "breakfast_status": 0, // 早餐登记状态
+    "reason_b64": "" // 不允许早餐的理由，UTF-8 Base64
   }
 }
 ```
 
+### Optional examination fields
+- `exam_type_b64` optionally contains the UTF-8 examination type encoded as Base64.
+- `organization_name_b64` optionally contains the UTF-8 organization name encoded as Base64.
+- `exam_total_price` is an optional non-negative decimal string with at most two decimal places. It is never parsed as a floating-point number.
+- Missing, blank, undecodable, or malformed optional examination fields do not reject the remaining customer response.
+- After the query completes, each missing examination field is shown in green at its own dialog position as `记录缺失，请人工核对`.
+
 ### Photo contract
-- `avatar_b64` and `avatar_url` are both optional; neither field is required for a successful customer response.
-- `avatar_b64` is temporarily bypassed: the current client neither parses nor displays it.
-- The approval dialog currently loads photos only from `avatar_url`.
+- The approval dialog loads photos only from the optional `avatar_url` field.
 - Absolute HTTP(S) URLs are used directly. Relative URLs are resolved against the backend scheme, host, and port used for the customer query.
 - A missing, invalid, unreachable, or non-image URL leaves the fixed placeholder visible.
 - Missing or failed photo data does not prevent the remaining customer fields from being parsed and displayed independently.
@@ -83,4 +90,6 @@ The response is expected to contain a payload similar to:
 - A new scan replaces the customer model and cancels the previous URL image request so stale photo results do not appear for the next customer.
 - The client uses `allow_breakfast` and `breakfast_status` as the business gating inputs; `has_breakfast` is treated as informational only.
 - After either breakfast action is queued, the approval dialog closes immediately and a fixed three-second visual confirmation is shown while network execution continues in the background.
+- Background enrollment results are also posted to the Android notification shade. Successful notifications include the order code and customer name; blocked notifications include the decoded `reason_b64` when available.
+- Approval notifications remain available for later review and can be dismissed like ordinary system notifications. Android 13 and newer require the operator to grant notification permission.
 - Scans may repeat normally; equivalent pending work is compacted only inside WaitGroup.

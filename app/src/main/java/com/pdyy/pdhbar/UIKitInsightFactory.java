@@ -12,4 +12,12 @@ final class UIKitInsightFactory {
     static NewUIInsightPlay create(UIInsightPlayConfig config, UIInsightCss css) {
         return NewInsightKt.NewInsight(config, css);
     }
+
+    static void updateScan2Fail(NewUIInsightPlay insight, int value) {
+        insight.fix2fail(value);
+    }
+
+    static int readScan2Fail(NewUIInsightPlay insight) {
+        return insight.getScan2fail().getValue();
+    }
 }

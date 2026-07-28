@@ -1,5 +1,8 @@
 package com.pdyy.pdhbar.runtime
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.ComponentName
@@ -16,6 +19,10 @@ import android.os.Parcel
 import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import com.pdyy.pdhbar.MainActivity
+import com.pdyy.pdhbar.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -36,6 +43,7 @@ import java.net.URI
 import java.net.URL
 import java.net.URLEncoder
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
@@ -53,6 +61,8 @@ private const val DEFAULT_API_SCHEME = "http"
 private const val DEFAULT_API_HOST = "172.16.203.56"
 private const val DEFAULT_API_PORT = 8088
 private const val RUNTIME_TAG = "BreakfastRuntime"
+private const val APPROVAL_NOTIFICATION_CHANNEL = "breakfast_approval_results"
+private const val APPROVAL_NOTIFICATION_CHANNEL_NAME = "早餐审批结果"
 const val SCAN_REPEAT_DELAY_MS = 1_200L
 private const val SUNMI_SCANNER_SETTING_ACTION = "com.sunmi.scanner.ACTION_BAR_DEVICES_SETTING"
 private const val SUNMI_SCANNER_SERIAL_SETTING_ACTION = "com.sunmi.scanner.ACTION_SCANNER_SERIAL_SETTING"
@@ -127,10 +137,10 @@ class std private constructor(
             )
             val sharedConfig = context?.applicationContext?.readRuntimeSharedConfig() ?: RuntimeSharedConfig()
 
-            val pipefall = PipeFall()
+            val pipefall = PipeFall(requireNotNull(context).applicationContext)
             val systemIO = OnBindSystemIO(pipefall)
             val api = Postman(target = target)
-            val waitgroup = WaitGroup(requireNotNull(context).applicationContext) { request ->
+            val waitgroup = WaitGroupBuffer(requireNotNull(context).applicationContext) { request ->
                 api.executeWaitGroupRequest(request)
             }
             pipefall.bindWaitGroup(waitgroup)
@@ -160,10 +170,6 @@ class std private constructor(
             context.applicationContext.writeApiTarget(run().api.target)
             context.applicationContext.writeRuntimeSharedConfig(RuntimeSharedConfig(run().scannerGunMode))
             run().waitgroup.persist()
-        }
-
-        fun destroy() {
-            buffer?.waitgroup?.destroy()
         }
 
         fun attachSystemIO(binder: IBinder) {
@@ -628,7 +634,7 @@ data class NetTarget(
     val headers: Map<String, String> = emptyMap(),
     val connectTimeoutMs: Long = 10000,
     val readTimeoutMs: Long = 20000,
-    val retry: Int = 2,
+    val retry: Int = 9,
     val terminalId: String? = null,
     val operatorId: String? = null,
     val barcode: String? = null,
@@ -895,7 +901,13 @@ class PostJsonAction(
 
                 attempt += 1
                 if (attempt <= maxRetry) {
-                    delay((300L * attempt).coerceAtMost(1_500L))
+                    val retryDelayMs = (300L * (1L shl (attempt - 1).coerceAtMost(5)))
+                        .coerceAtMost(10_000L)
+                    Log.d(
+                        RUNTIME_TAG,
+                        "post retry scheduled ${attempt + 1}/${maxRetry + 1} in ${retryDelayMs}ms"
+                    )
+                    delay(retryDelayMs)
                 }
             }
 
@@ -1073,10 +1085,12 @@ sealed interface UiCommand {
         val name: String,
         val sex: String?,
         val phone: String?,
-        val avatarBase64: String?,
         val avatarUrl: String?,
         val birthDate: String?,
         val packageName: String?,
+        val examType: String?,
+        val organizationName: String?,
+        val examTotalPrice: String?,
         val hasBreakfast: Boolean,
         val allowBreakfast: Boolean,
         val blockReason: String?,
@@ -1113,13 +1127,17 @@ data class NetRoute(
     val path: String = ""
 )
 
-class PipeFall : PipeFallIO() {
+class PipeFall(context: Context) : PipeFallIO() {
+    private val appContext = context.applicationContext
     private sealed interface SubmissionState {
         data object Idle : SubmissionState
         data class Submitting(val orderCode: String, val status: String) : SubmissionState
     }
 
     private val workerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // Queue submissions use an independent supervised buffer. A failed submission destroys
+    // only its own child job and cannot cancel the scan/event collector.
+    private val queueBufferScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val eventSocket = MutableSharedFlow<UiEvent>(extraBufferCapacity = 64)
     private val commandSocket = MutableSharedFlow<UiCommand>(extraBufferCapacity = 64)
@@ -1135,6 +1153,8 @@ class PipeFall : PipeFallIO() {
         private set
     private var waitGroup: WaitGroupIO? = null
     private val submissionState = AtomicReference<SubmissionState>(SubmissionState.Idle)
+    private val customerDialogOpen = AtomicReference(false)
+    private val hiddenCustomerQueries = ConcurrentHashMap.newKeySet<String>()
 
     init {
         workerScope.launch {
@@ -1156,6 +1176,10 @@ class PipeFall : PipeFallIO() {
     }
 
     override fun writeEvent(event: UiEvent) {
+        if (event is UiEvent.ScanCode && customerDialogOpen.get()) {
+            Log.d(RUNTIME_TAG, "scan ignored while customer dialog is open")
+            return
+        }
         if (event is UiEvent.ScanCode && submissionState.get() !is SubmissionState.Idle) {
             Log.d(RUNTIME_TAG, "scan ignored while breakfast status is submitting")
             return
@@ -1166,6 +1190,7 @@ class PipeFall : PipeFallIO() {
                 is UiEvent.BreakfastCancel -> event.orderCode
                 else -> return
             }
+            hiddenCustomerQueries += orderCode
             val status = if (event is UiEvent.BreakfastDone) "1" else "0"
             if (!submissionState.compareAndSet(
                     SubmissionState.Idle,
@@ -1178,6 +1203,11 @@ class PipeFall : PipeFallIO() {
             writeCommand(UiCommand.SubmissionChanged(true))
         }
         if (event is UiEvent.ScanCode) {
+            customerDialogOpen.set(true)
+            latestScanCode?.value
+                ?.takeIf { it != event.code }
+                ?.let(hiddenCustomerQueries::add)
+            hiddenCustomerQueries -= event.code
             latestScanCode = ScanCodePayload(event.code)
             if (event.code.isNotBlank()) {
                 writeCommand(
@@ -1187,10 +1217,12 @@ class PipeFall : PipeFallIO() {
                         name = "N/A 查询中",
                         sex = null,
                         phone = null,
-                        avatarBase64 = null,
                         avatarUrl = null,
                         birthDate = null,
                         packageName = "N/A 查询中",
+                        examType = null,
+                        organizationName = null,
+                        examTotalPrice = null,
                         hasBreakfast = false,
                         allowBreakfast = false,
                         blockReason = null,
@@ -1207,6 +1239,7 @@ class PipeFall : PipeFallIO() {
                 writeCommand(UiCommand.SubmissionChanged(false))
             }
             if (event is UiEvent.ScanCode) {
+                customerDialogOpen.set(false)
                 writeCommand(UiCommand.CloseDialog)
             }
             writeCommand(UiCommand.Toast("扫码任务繁忙，请稍后再扫"))
@@ -1258,13 +1291,19 @@ class PipeFall : PipeFallIO() {
             return
         }
 
-        workerScope.launch {
-            waitGroup?.push(orderCode, WaitGroupTask.QueryBreakfastRight)
-                ?: writeCommand(UiCommand.Toast("任务队列尚未初始化"))
+        queueBufferScope.launch {
+            val queued = pushToWaitGroup(orderCode, WaitGroupTask.QueryBreakfastRight)
+            if (!queued) {
+                customerDialogOpen.set(false)
+                writeCommand(UiCommand.CloseDialog)
+                writeCommand(UiCommand.Toast("本次扫码入队失败，请重新扫码"))
+            }
         }
     }
 
     private fun cancelCustomerQuery() {
+        customerDialogOpen.set(false)
+        latestScanCode?.value?.let(hiddenCustomerQueries::add)
         writeCommand(UiCommand.CloseDialog)
     }
 
@@ -1278,7 +1317,11 @@ class PipeFall : PipeFallIO() {
             finishSubmission("任务队列尚未初始化")
             return
         }
-        queue.push(orderCode, task)
+        if (!pushToWaitGroup(orderCode, task, queue)) {
+            finishSubmission("本次操作入队失败，请重试")
+            return
+        }
+        customerDialogOpen.set(false)
         submissionState.set(SubmissionState.Idle)
         writeCommand(UiCommand.SubmissionChanged(false))
         writeCommand(
@@ -1289,10 +1332,33 @@ class PipeFall : PipeFallIO() {
         )
     }
 
+    private suspend fun pushToWaitGroup(
+        orderCode: String,
+        task: WaitGroupTask,
+        queue: WaitGroupIO? = waitGroup
+    ): Boolean {
+        val target = queue ?: return false
+        return try {
+            target.push(orderCode, task)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            Log.e(
+                RUNTIME_TAG,
+                "discarding failed queue-buffer task: orderCode=$orderCode task=$task",
+                error
+            )
+            false
+        }
+    }
+
     private fun handleWaitGroupOutput(output: WaitGroupOutput) {
         when (output.request.task) {
             WaitGroupTask.QueryBreakfastRight -> showCustomerFromQueue(output)
             WaitGroupTask.Enroll, WaitGroupTask.CancelEnrollment -> {
+                if (output.request.task == WaitGroupTask.Enroll) {
+                    notifyEnrollmentResult(output)
+                }
                 if (output.outcome == WaitGroupOutcome.Completed) {
                     writeCommand(UiCommand.Toast(if (output.request.task == WaitGroupTask.Enroll) {
                         "早餐核销成功"
@@ -1306,7 +1372,35 @@ class PipeFall : PipeFallIO() {
         }
     }
 
+    private fun notifyEnrollmentResult(output: WaitGroupOutput) {
+        val customer = output.result.responseText?.let(::parseBreakfastRight)
+        val name = customer?.name?.takeIf { it.isNotBlank() && it != "未知客户" }
+        val person = name?.let { "（$it）" }.orEmpty()
+        val blocked = customer?.allowBreakfast == false ||
+            output.result.message?.contains("无早餐权益") == true
+        val title: String
+        val text: String
+        if (blocked) {
+            title = "早餐审批：无早餐权益"
+            val reason = customer?.reason?.takeIf(String::isNotBlank) ?: "后端未提供具体理由"
+            text = "导检单号 ${output.request.orderCode}$person：$reason"
+        } else if (output.outcome == WaitGroupOutcome.Completed && output.result.success) {
+            title = "早餐登记成功"
+            text = "导检单号 ${output.request.orderCode}$person 已成功登记早餐"
+        } else {
+            return
+        }
+        postApprovalNotification(appContext, output.id, title, text)
+    }
+
     private fun showCustomerFromQueue(output: WaitGroupOutput) {
+        if (output.request.orderCode in hiddenCustomerQueries) {
+            Log.d(
+                RUNTIME_TAG,
+                "late customer result ignored after dialog closed: orderCode=${output.request.orderCode}"
+            )
+            return
+        }
         if (output.outcome != WaitGroupOutcome.Completed) {
             writeCommand(UiCommand.Toast(output.result.message ?: "客户信息查询失败"))
             return
@@ -1325,10 +1419,12 @@ class PipeFall : PipeFallIO() {
                 name = breakfastRight.name,
                 sex = breakfastRight.sex,
                 phone = breakfastRight.phone,
-                avatarBase64 = null,
                 avatarUrl = resolvedAvatarUrl,
                 birthDate = breakfastRight.birthDate,
                 packageName = breakfastRight.packageName,
+                examType = breakfastRight.examType,
+                organizationName = breakfastRight.organizationName,
+                examTotalPrice = breakfastRight.examTotalPrice,
                 hasBreakfast = breakfastRight.hasBreakfast,
                 allowBreakfast = breakfastRight.allowBreakfast,
                 blockReason = blockReason
@@ -1337,6 +1433,7 @@ class PipeFall : PipeFallIO() {
     }
 
     private fun finishSubmission(message: String) {
+        customerDialogOpen.set(false)
         submissionState.set(SubmissionState.Idle)
         writeCommand(UiCommand.SubmissionChanged(false))
         writeCommand(UiCommand.Toast(message))
@@ -1368,13 +1465,52 @@ private data class BreakfastRightView(
     val avatarUrl: String?,
     val birthDate: String?,
     val packageName: String?,
+    val examType: String?,
+    val organizationName: String?,
+    val examTotalPrice: String?,
     val hasBreakfast: Boolean,
-    val allowBreakfast: Boolean
+    val allowBreakfast: Boolean,
+    val reason: String?
 )
+
+private fun postApprovalNotification(context: Context, key: String, title: String, text: String) {
+    val manager = context.getSystemService(NotificationManager::class.java)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        manager.createNotificationChannel(
+            NotificationChannel(
+                APPROVAL_NOTIFICATION_CHANNEL,
+                APPROVAL_NOTIFICATION_CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_DEFAULT
+            )
+        )
+    }
+    val openApp = PendingIntent.getActivity(
+        context,
+        key.hashCode(),
+        Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+        },
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    )
+    val notification = NotificationCompat.Builder(context, APPROVAL_NOTIFICATION_CHANNEL)
+        .setSmallIcon(R.drawable.ic_launcher_foreground)
+        .setContentTitle(title)
+        .setContentText(text)
+        .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+        .setContentIntent(openApp)
+        .setAutoCancel(true)
+        .setOnlyAlertOnce(true)
+        .build()
+    runCatching {
+        NotificationManagerCompat.from(context).notify(key.hashCode(), notification)
+    }.onFailure {
+        Log.w(RUNTIME_TAG, "approval notification unavailable: ${it.message}")
+    }
+}
 
 private fun BreakfastRightView.blockReason(): String? {
     if (allowBreakfast) return null
-    return "无早餐权益：allow_breakfast=false"
+    return reason?.takeIf(String::isNotBlank) ?: "后台未提供具体理由"
 }
 
 private fun executeHttp(
@@ -1450,7 +1586,12 @@ private fun executeRawHttp11Post(target: NetTarget, body: String): RawHttpRespon
         val responseText = readRawHttpResponse(socket)
         val headerEnd = responseText.indexOf("\r\n\r\n")
         val headerText = if (headerEnd >= 0) responseText.substring(0, headerEnd) else responseText
-        val bodyText = if (headerEnd >= 0) responseText.substring(headerEnd + 4) else ""
+        val rawBodyText = if (headerEnd >= 0) responseText.substring(headerEnd + 4) else ""
+        val bodyText = if (Regex("(?i)transfer-encoding\\s*:\\s*chunked").containsMatchIn(headerText)) {
+            decodeChunkedBody(rawBodyText)
+        } else {
+            rawBodyText
+        }
         val statusCode = headerText.lineSequence()
             .firstOrNull()
             ?.split(" ")
@@ -1460,6 +1601,30 @@ private fun executeRawHttp11Post(target: NetTarget, body: String): RawHttpRespon
 
         return RawHttpResponse(statusCode = statusCode, body = bodyText)
     }
+}
+
+private fun decodeChunkedBody(raw: String): String {
+    val decoded = StringBuilder()
+    var cursor = 0
+    while (cursor < raw.length) {
+        val lineEnd = raw.indexOf("\r\n", cursor)
+        if (lineEnd < 0) throw IllegalArgumentException("invalid chunked response")
+        val size = raw.substring(cursor, lineEnd)
+            .substringBefore(';')
+            .trim()
+            .toIntOrNull(16)
+            ?: throw IllegalArgumentException("invalid chunk size")
+        cursor = lineEnd + 2
+        if (size == 0) return decoded.toString()
+        if (cursor + size > raw.length) throw IllegalArgumentException("truncated chunked response")
+        decoded.append(raw, cursor, cursor + size)
+        cursor += size
+        if (!raw.startsWith("\r\n", cursor)) {
+            throw IllegalArgumentException("invalid chunk terminator")
+        }
+        cursor += 2
+    }
+    throw IllegalArgumentException("missing final chunk")
 }
 
 private fun readRawHttpResponse(socket: Socket): String {
@@ -1523,6 +1688,9 @@ private fun ByteArray.indexOfHeaderEnd(): Int {
 
 private fun parseBreakfastRight(json: String): BreakfastRightView? {
     val orderCode = json.stringField("order_code") ?: return null
+    val examType = json.base64Field("exam_type_b64")
+    val organizationName = json.base64Field("organization_name_b64")
+    val examTotalPrice = json.priceStringField("exam_total_price")
     val avatarUrl = json.nullableStringField("avatar_url")
     return BreakfastRightView(
         orderCode = orderCode,
@@ -1533,8 +1701,12 @@ private fun parseBreakfastRight(json: String): BreakfastRightView? {
         avatarUrl = avatarUrl,
         birthDate = json.nullableStringField("birth_date"),
         packageName = json.base64Field("package_name_b64"),
+        examType = examType,
+        organizationName = organizationName,
+        examTotalPrice = examTotalPrice,
         hasBreakfast = json.booleanField("has_breakfast") ?: false,
-        allowBreakfast = json.booleanField("allow_breakfast") ?: false
+        allowBreakfast = json.booleanField("allow_breakfast") ?: false,
+        reason = json.base64Field("reason_b64")
     )
 }
 
@@ -1573,6 +1745,12 @@ private fun String.booleanField(name: String): Boolean? {
         ?.groupValues
         ?.getOrNull(1)
         ?.toBooleanStrictOrNull()
+}
+
+private fun String.priceStringField(name: String): String? {
+    return nullableStringField(name)?.takeIf {
+        Regex("\\d+(?:\\.\\d{1,2})?").matches(it)
+    }
 }
 
 private fun String.urlEncode(): String {

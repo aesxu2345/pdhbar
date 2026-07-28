@@ -19,10 +19,12 @@ card_no     可选，卡号；有就传，没有可不传
     "name_b64": "5byg5LiJ",
     "sex_b64": "55S3",
     "phone": "138****8888",
-    "avatar_b64": "<358x441 JPEG 的纯 Base64>",
     "avatar_url": "",
     "birth_date": "1990-01-01",
     "package_name_b64": "5L2T5qOA5aWX6aSQ",
+    "exam_type_b64": "5YWl6IGM5L2T5qOA",
+    "organization_name_b64": "5p+Q5p+Q5YWs5Y+4",
+    "exam_total_price": "680.00", // 可选：体检总价字符串，不使用浮点数
     "has_breakfast": true,
     "allow_breakfast": true,
     "breakfast_status": 0,
@@ -40,10 +42,12 @@ card_no     可选，卡号；有就传，没有可不传
     "name_b64": "5byg5LiJ",
     "sex_b64": "55S3",
     "phone": "138****8888",
-    "avatar_b64": "<358x441 JPEG 的纯 Base64>",
     "avatar_url": "",
     "birth_date": "1990-01-01",
     "package_name_b64": "5L2T5qOA5aWX6aSQ",
+    "exam_type_b64": "5YWl6IGM5L2T5qOA",
+    "organization_name_b64": "5p+Q5p+Q5YWs5Y+4",
+    "exam_total_price": "680.00", // 可选：体检总价字符串，不使用浮点数
     "has_breakfast": false,
     "allow_breakfast": false,
     "breakfast_status": 0,
@@ -67,17 +71,13 @@ sex_b64
 phone
     手机号，建议脱敏
 
-avatar_b64
-    可选。当前客户端暂时 bypass 此字段，不解析、不解码、不参与照片展示
-
 avatar_url
     可选。当前客户端唯一使用的头像来源
     绝对 HTTP(S) 地址直接使用；相对地址按本次客户查询使用的后端 scheme、host、port 解析
     URL 图片异步加载，允许晚于客户基础信息显示
 
 头像字段约束
-    avatar_b64 与 avatar_url 均可缺失、为 null 或为空字符串
-    当前即使两者同时存在也只使用 avatar_url
+    avatar_url 可缺失、为 null 或为空字符串
     URL 缺失、无效、不可达或内容不是图片时，审批弹窗保持占位头像
     头像是否存在、加载是否成功不影响剩余客户信息的独立解析和展示
     新扫码会替换客户模型并取消上一客户的 URL 图片请求，避免旧头像回灌
@@ -87,6 +87,22 @@ birth_date
 
 package_name_b64
     套餐名称，UTF-8 后 Base64
+
+exam_type_b64
+    可选。体检类型，UTF-8 后 Base64
+    缺失、为空或 Base64 无效时，不影响其他客户字段解析
+
+organization_name_b64
+    可选。单位名称，UTF-8 后 Base64
+    缺失、为空或 Base64 无效时，不影响其他客户字段解析
+
+exam_total_price
+    可选。体检总价字符串，非负十进制格式且最多两位小数
+    客户端始终按字符串处理，不转换为 Float 或 Double；缺失或格式无效时不影响其他客户字段解析
+
+体检字段缺失展示
+    完整查询响应中，上述任一可选字段缺失或无效时，审批弹窗在该字段位置显示绿色“记录缺失，请人工核对”
+    查询尚未完成时仍显示“N/A 查询中”，不视为记录缺失
 
 has_breakfast
     冗余字段，仅展示/调试用
@@ -143,10 +159,12 @@ data class BreakfastRightData(
     val name_b64: String?,
     val sex_b64: String?,
     val phone: String?,
-    val avatar_b64: String?,
     val avatar_url: String?,
     val birth_date: String?,
     val package_name_b64: String?,
+    val exam_type_b64: String?,
+    val organization_name_b64: String?,
+    val exam_total_price: String?,
     val has_breakfast: Boolean?,
     val allow_breakfast: Boolean,
     val breakfast_status: Int,

@@ -13,14 +13,14 @@ val verifyUIKitInsightAar by tasks.registering {
 
     doLast {
         val expected = checksums.asFile.readLines()
-            .first { it.trim().endsWith("uikit/UIKitInsight-release.aar") }
+            .first { it.trim().substringAfterLast('/').endsWith("UIKitInsight-release.aar") }
             .trim()
             .split(Regex("\\s+"), limit = 2)
             .first()
         val digest = MessageDigest.getInstance("SHA-256")
         val actual = digest.digest(aar.asFile.readBytes()).joinToString("") { "%02x".format(it) }
         check(actual == expected) {
-            "UIKitInsight AAR 校验失败：期望 $expected，实际 $actual。请更新 uikit 制品及 SHA256SUMS。"
+            "UIKitInsight AAR 校验失败：期望 $expected，实际 $actual。请同步更新 uikit 制品及 SHA256SUMS。"
         }
     }
 }
@@ -86,7 +86,7 @@ dependencies {
     implementation(libs.google.mlkit.barcode.scanning)
     implementation(libs.coil.compose)
     implementation(libs.coil.network.okhttp)
-    // Versioned local UIKit AAR and its integration guide live together under /uikit.
+    // UIKit AAR and its checksum are distributed together under /uikit.
     implementation("org.mozilla.geckoview:geckoview:152.0.20260713164047")
     implementation(files(rootProject.file("uikit/UIKitInsight-release.aar")))
     coreLibraryDesugaring(libs.desugar.jdk.libs)

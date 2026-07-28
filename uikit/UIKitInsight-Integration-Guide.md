@@ -114,8 +114,8 @@ NewUIInsightPlay insight = NewInsightKt.NewInsight(
 
 | API / 值 | 行为 |
 | --- | --- |
-| `fix2fail(value > 0)` | 显示橙色环形区段、第三行图例和 leader line 百分比 |
-| `fix2fail(0)` | 清零并隐藏橙色状态，恢复 firstRoute 的两段图表 |
+| `fix2fail(value > 0)` | 显示橙色环形区段；“已扫码未登记”图例固定在第一行，触碰饼图后 leader line 百分比显示 4 秒 |
+| `fix2fail(0)` | 清除橙色环形区段，但第一行图例继续诚实显示 `0 (0.0%)` |
 | `fix2fail(value < 0)` | 拒绝无效数量并抛出 `IllegalArgumentException`，原状态不变 |
 | `getScan2fail().getValue()` | 读取当前已扫码未登记数量 |
 | `Destory()` / `Destroy()` | 销毁状态对象；之后再次调用 `fix2fail()` 会抛出 `IllegalStateException` |
@@ -138,6 +138,8 @@ scan2failPercent  = scan2fail / displayTotal * 100
 ```
 
 例如 firstRoute 为已完成 `5`、剩余 `2`，再调用 `fix2fail(1)`，第一幕会展示 `62.5% / 25.0% / 12.5%`，而不是继续使用服务端原来的 `71.4% / 28.6%`。没有有效 firstRoute 数据时仍保持原有 `N/A` 与 1% 占位环，不用虚构数据计算橙色占比；待后续轮询取得完整数据后，已保存的 `scan2fail` 会自动参与重算。
+
+当真实 `scan2failPercent` 位于 `(0%, 1%]` 时，橙色扇区的绘图角度最低按 1% 展示，避免有效状态在高总人数场景中消失。该保底只作用于 SVG 几何：图例、中心完成率和触碰后 leader line 仍显示上述公式计算出的真实百分比；已完成与剩余扇区仅在绘图角度上按比例让出这 1% 空间。
 
 第一路由在首屏加载后每 10 秒重新请求一次。刷新请求开始时保留当前画面，成功且三周期数据完整时一次性替换；HTTP 非成功状态、网络异常或响应数据无效时切换到上述 `N/A` 状态。Toast 判据不是路由能否 ping 通或是否返回 HTTP 200，而是本轮是否捕获到完整且一致的 `day/month/year` 有效数据；连续 10 轮未获得有效数据后仅提示一次，后续仍继续数据轮询以便服务恢复，但不会重复提示。任意一轮捕获到有效数据都会在提示触发前清零连续失败计数。
 

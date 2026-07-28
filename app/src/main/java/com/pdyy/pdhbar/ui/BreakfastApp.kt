@@ -26,6 +26,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -143,6 +144,13 @@ private fun CustomerDialog(
                 Text("订单号：${customer.orderCode}")
                 Text("姓名：${customer.name}")
                 Text("套餐：${customer.packageName ?: "-"}")
+                OptionalExamField("体检类型", customer.examType, customer.querying)
+                OptionalExamField("单位名称", customer.organizationName, customer.querying)
+                OptionalExamField(
+                    "体检总价",
+                    customer.examTotalPrice?.let { "¥$it" },
+                    customer.querying
+                )
                 Text("早餐状态：${if (customer.hasBreakfast) "已登记" else "未登记"}")
             }
         },
@@ -162,4 +170,15 @@ private fun CustomerDialog(
             }
         }
     )
+}
+
+@Composable
+private fun OptionalExamField(label: String, value: String?, querying: Boolean) {
+    Row {
+        Text("$label：")
+        Text(
+            text = value ?: if (querying) "N/A 查询中" else "记录缺失，请人工核对",
+            color = if (value == null && !querying) Color(0xFF18A558) else Color.Unspecified
+        )
+    }
 }

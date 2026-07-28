@@ -96,6 +96,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -167,14 +168,20 @@ private fun createUIKitInsight(
     return insight
 }
 
-private fun applyUIKitWaitGroupCorrection(insight: NewUIInsightPlay, correctionValue: Int) {
+private fun applyUIKitWaitGroupCorrection(
+    insight: NewUIInsightPlay,
+    waitGroupLength: Int
+) {
+    val value = waitGroupLength.coerceAtLeast(0)
     runCatching {
-        insight.fix2fail(correctionValue.coerceAtLeast(0))
-        check(insight.scan2fail.value == correctionValue.coerceAtLeast(0)) {
-            "UIKit wait-group correction was not applied"
+        UIKitInsightFactory.updateScan2Fail(insight, value)
+        val actualValue = UIKitInsightFactory.readScan2Fail(insight)
+        check(actualValue == value) {
+            "UIKit scan2fail value mismatch: expected=$value, actual=$actualValue"
         }
+        Log.d(APP_TAG, "WaitGroup length delivered to UIKit scan2fail: $value")
     }.onFailure { error ->
-        Log.w(APP_TAG, "failed to apply UIKit wait-group correction", error)
+        Log.w(APP_TAG, "Unable to deliver WaitGroup length to UIKit scan2fail: $value", error)
     }
 }
 
@@ -468,7 +475,7 @@ fun BreakfastApp() {
         ScannerPreviewCard(
             modifier = Modifier.fillMaxSize(),
             scannerGunMode = scannerGunMode,
-            scanBlocked = submittingBreakfast,
+            scanBlocked = customer != null || submittingBreakfast || queuedBreakfast != null,
             onBackToInsight = { uiLayerVisible = true },
             onScanned = { code ->
                 std.run().barscanner.onScan(code)
@@ -500,8 +507,10 @@ fun BreakfastApp() {
                 insightFirstRoute = insightFirstRoute,
                 insightSecondRoute = insightSecondRoute,
                 onInsightCardNo = { cardNo ->
-                    scope.launch {
-                        std.run().barscanner.onScan(cardNo)
+                    if (customer == null && !submittingBreakfast && queuedBreakfast == null) {
+                        scope.launch {
+                            std.run().barscanner.onScan(cardNo)
+                        }
                     }
                 }
             )
@@ -712,9 +721,8 @@ private fun UIKitInsightLayer(
 
     LaunchedEffect(insight) {
         val waitGroup = std.run().waitgroup
-        applyUIKitWaitGroupCorrection(insight, waitGroup.len())
-        waitGroup.lenUpdates.collect { correctionValue ->
-            applyUIKitWaitGroupCorrection(insight, correctionValue)
+        waitGroup.lenUpdates.collect { waitGroupLength ->
+            applyUIKitWaitGroupCorrection(insight, waitGroupLength)
         }
     }
 
@@ -726,8 +734,8 @@ private fun UIKitInsightLayer(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
-                applyUIKitWaitGroupCorrection(insight, std.run().waitgroup.len())
                 insight.Display(viewContext, this)
+                applyUIKitWaitGroupCorrection(insight, std.run().waitgroup.len())
             }
         }
     )
@@ -1402,6 +1410,15 @@ private fun CustomerDialog(
     onCancelBreakfast: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    var backgroundApprovalAvailable by remember(customer.orderCode, customer.querying) {
+        mutableStateOf(false)
+    }
+    LaunchedEffect(customer.orderCode, customer.querying) {
+        if (customer.querying) {
+            delay(3_000L)
+            backgroundApprovalAvailable = true
+        }
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("客户早餐信息") },
@@ -1415,10 +1432,38 @@ private fun CustomerDialog(
                 Text("订单号：${customer.orderCode}")
                 Text("姓名：${customer.name}")
                 Text("套餐：${customer.packageName ?: "-"}")
+                OptionalExamField(
+                    label = "体检类型",
+                    value = customer.examType,
+                    querying = customer.querying
+                )
+                OptionalExamField(
+                    label = "单位名称",
+                    value = customer.organizationName,
+                    querying = customer.querying
+                )
+                OptionalExamField(
+                    label = "体检总价",
+                    value = customer.examTotalPrice?.let { "¥$it" },
+                    querying = customer.querying
+                )
                 Text("早餐状态：${if (customer.querying) "N/A 查询中" else if (customer.hasBreakfast) "已登记" else "未登记"}")
                 Text("权益状态：${if (customer.querying) "N/A 查询中" else if (customer.allowBreakfast) "允许" else "不允许"}")
                 customer.blockReason?.let { reason ->
-                    Text("原因：$reason", color = Color(0xFFD32F2F))
+                    Text(
+                        text = "原因：$reason",
+                        color = Color(0xFFD32F2F),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                if (customer.querying && backgroundApprovalAvailable) {
+                    Text(
+                        "时间过长？请试试后台静默审批",
+                        color = FlashlightGreen,
+                        fontSize = 12.sp,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
                 }
             }
         },
@@ -1427,7 +1472,9 @@ private fun CustomerDialog(
                 enabled = customer.querying || customer.blockReason == null,
                 onClick = onDone,
                 colors = DialogButtonColors
-            ) { Text(if (customer.querying) "后台审批" else "完成早餐") }
+            ) {
+                Text(if (customer.querying) "后台审批" else "完成早餐")
+            }
         },
         dismissButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1440,6 +1487,17 @@ private fun CustomerDialog(
             }
         }
     )
+}
+
+@Composable
+private fun OptionalExamField(label: String, value: String?, querying: Boolean) {
+    Row {
+        Text("$label：")
+        Text(
+            text = value ?: if (querying) "N/A 查询中" else "记录缺失，请人工核对",
+            color = if (value == null && !querying) FlashlightGreen else Color.Unspecified
+        )
+    }
 }
 
 @Composable
