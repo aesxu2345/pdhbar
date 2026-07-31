@@ -6,8 +6,7 @@
    See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+   <!-- WaitGroup is live device-local work. Restoring it after reinstall would
+       resurrect already handled scans as ghost records. -->
+   <exclude domain="sharedpref" path="breakfast_wait_group.xml" />
 </full-backup-content>

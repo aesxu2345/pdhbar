@@ -6,10 +6,13 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.PackageManager
 import android.media.MediaPlayer
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.Process
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -105,7 +108,6 @@ import coil3.compose.SubcomposeAsyncImage
 import coil3.compose.SubcomposeAsyncImageContent
 import com.pdyy.pdhbar.runtime.IPv4Address
 import com.pdyy.pdhbar.runtime.NetRoute
-import com.pdyy.pdhbar.runtime.PipeFallIO
 import com.pdyy.pdhbar.runtime.UiCommand
 import com.pdyy.pdhbar.runtime.std
 import com.pdyy.pdhbar.scanner.MLKitBarcodeAnalyzer
@@ -120,12 +122,15 @@ import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 private val ScannerLineColor = Color(0xFF0A653A)
 private val ScannerIconLineColor = Color(0xFFF4FFF9)
 private val FlashlightGreen = ScannerLineColor
 private val GlassBlack = Color(0xD90A0B0F)
 private const val APP_TAG = "BreakfastApp"
+private const val ScannerGateTimeoutMs = 7_000L
 private const val UiSettingsPrefsName = "breakfast_ui_settings"
 private const val IdPhotoWidthPx = 358
 private const val IdPhotoHeightPx = 441
@@ -135,8 +140,6 @@ private const val InsightFirstRouteKey = "insight_first_route"
 private const val InsightSecondRouteKey = "insight_second_route"
 private const val DefaultInsightRoute = "http://129.153.98.122:8080/ZbXiOJvl_u0yYmWK/BKheVq-FzHT3oXfIozIanpfrXFG9wJB7ts9WNw8Snvn5XoSj8Fi08ju1YfaH8fk1Zeuug9QKq5u7YbACoxHpV7KCiOPoDREU1MhXj_5bbHUX54-dDiyEaKFULdhQ8wMAaaASUfkQ3GdmKyHtOTUc6Nkv9gXXuYI3asu6NmtYdJ_O5hKypr9QV8Cmcaycud4voUdeszcJrHM6ViDFCGi5uFaFX4xfQ-GaxKzyvBz9qUIooQ_lAw9Zy7A8wW7NPpQ5c3aB9Ewc7WFPWcHj79NgeQv73bslsat1DhAtirGjXcMIfvTv8fjED6oWdmm95T9pq_TWa8wpz8BZH8dVK-bJOQ"
 private const val DefaultInsightFirstRoute = "$DefaultInsightRoute/provider"
-// Keep UIKit's built-in signed-route verification enabled.
-private const val BypassUIKitRouteSignatureCheck = false
 
 private fun defaultInsightFirstRoute(): String = DefaultInsightFirstRoute
 
@@ -150,7 +153,8 @@ private class BreakfastInsightConfig(
     override val ip: String = insightPanelAddress.ifBlank { DefaultInsightPanelAddress }
     override val firstRoute: String = firstRouteUrl.ifBlank { defaultInsightFirstRoute() }
     override val secondRoute: String = secondRouteUrl.ifBlank { defaultInsightSecondRoute() }
-    override val bypass: Boolean = BypassUIKitRouteSignatureCheck
+    // Production invariant: signed-route verification cannot be disabled by settings or JSON.
+    override val bypass: Boolean = false
 }
 
 private fun createUIKitInsight(
@@ -183,6 +187,29 @@ private fun applyUIKitWaitGroupCorrection(
     }.onFailure { error ->
         Log.w(APP_TAG, "Unable to deliver WaitGroup length to UIKit scan2fail: $value", error)
     }
+}
+
+private class UIKitInsightHostView(context: Context) : FrameLayout(context) {
+    var renderedWaitGroupLength: Int? = null
+}
+
+private fun renderUIKitInsight(
+    insight: NewUIInsightPlay,
+    host: UIKitInsightHostView,
+    waitGroupLength: Int
+) {
+    val value = waitGroupLength.coerceAtLeast(0)
+    if (host.renderedWaitGroupLength == value) return
+
+    applyUIKitWaitGroupCorrection(insight, value)
+    host.removeAllViews()
+    insight.Display(host.context, host)
+    host.renderedWaitGroupLength = value
+    Log.d(
+        APP_TAG,
+        "UIKit visible view rendered: value=$value, " +
+            "insight=${System.identityHashCode(insight)}, host=${System.identityHashCode(host)}"
+    )
 }
 
 private data class UiJsonSettings(
@@ -276,23 +303,77 @@ private val DialogTextButtonColors
         disabledContentColor = FlashlightGreen.copy(alpha = 0.45f)
     )
 
-private class ScannerGate<T>(private val action: (T) -> Unit) {
+private class ScannerGate<T>(
+    context: Context,
+    private val action: (T) -> Unit
+) {
+    private val appContext = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
-    @Volatile private var blocked = false
+    private val lockedAt = AtomicLong(0L)
+    private val cancelled = AtomicBoolean(false)
 
     fun submit(value: T) {
-        if (blocked) return
-        handler.post { if (!blocked) action(value) }
+        // The first decoded result owns the gate immediately. Do not wait for the
+        // query coroutine or customer dialog to update Compose state. A stale lock
+        // can be atomically replaced after seven seconds, so it cannot deadlock.
+        if (cancelled.get() || !tryAcquire()) return
+        handler.post {
+            if (cancelled.get()) return@post
+            if (!appContext.isWifiConnected()) {
+                Toast.makeText(appContext, "WiFi未连接", Toast.LENGTH_SHORT).show()
+                lockedAt.set(0L)
+                return@post
+            }
+            action(value)
+        }
     }
 
     fun setBlocked(blocked: Boolean) {
-        this.blocked = blocked
+        if (!cancelled.get()) {
+            if (blocked) {
+                // Preserve the timestamp captured by submit(); later Compose dialog
+                // state must not restart the seven-second lock window.
+                val acquiredAt = lockTimestamp()
+                if (lockedAt.compareAndSet(0L, acquiredAt)) scheduleUnlock(acquiredAt)
+            } else {
+                lockedAt.set(0L)
+            }
+        }
     }
 
     fun cancel() {
-        blocked = true
+        cancelled.set(true)
+        lockedAt.set(lockTimestamp())
         handler.removeCallbacksAndMessages(null)
     }
+
+    private fun tryAcquire(): Boolean {
+        while (true) {
+            val previous = lockedAt.get()
+            val now = lockTimestamp()
+            if (previous != 0L && now - previous < ScannerGateTimeoutMs) return false
+            if (lockedAt.compareAndSet(previous, now)) {
+                scheduleUnlock(now)
+                return true
+            }
+        }
+    }
+
+    private fun scheduleUnlock(acquiredAt: Long) {
+        handler.postDelayed(
+            { lockedAt.compareAndSet(acquiredAt, 0L) },
+            ScannerGateTimeoutMs
+        )
+    }
+
+    private fun lockTimestamp(): Long = SystemClock.elapsedRealtime().coerceAtLeast(1L)
+}
+
+private fun Context.isWifiConnected(): Boolean {
+    val connectivityManager = getSystemService(ConnectivityManager::class.java) ?: return false
+    val activeNetwork = connectivityManager.activeNetwork ?: return false
+    val capabilities = connectivityManager.getNetworkCapabilities(activeNetwork) ?: return false
+    return capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
 }
 
 private fun beepOnScan(scanPlayer: MediaPlayer) {
@@ -555,18 +636,10 @@ fun BreakfastApp() {
         CustomerDialog(
             customer = data,
             onDone = {
-                if (data.querying) {
-                    std.run().uifurge.onBreakfastWaitClick(data.orderCode)
-                } else {
-                    std.run().uifurge.onBreakfastDoneClick(data.orderCode)
-                }
+                std.run().uifurge.onApproveBreakfastClick(data.orderCode)
             },
             onCancelBreakfast = {
-                if (data.querying) {
-                    std.run().uifurge.onBreakfastCancelWaitClick(data.orderCode)
-                } else {
-                    std.run().uifurge.onBreakfastCancelClick(data.orderCode)
-                }
+                std.run().uifurge.onCancelEnrollmentClick(data.orderCode)
             },
             onDismiss = {
                 customer = null
@@ -595,24 +668,25 @@ fun BreakfastApp() {
             onDismiss = { backendDialogOpen = false },
             onConfirm = { settings ->
                 val runtime = std.run()
-                val systemPipe = runtime.systemIO as? PipeFallIO
-                if (systemPipe == null) {
-                    Toast.makeText(context, "系统服务未连接，后端地址未保存", Toast.LENGTH_SHORT).show()
-                    backendDialogOpen = false
-                    return@BackendTargetDialog
-                }
+                // “保存”本身就是一次提交触发器，不以配置内容是否发生变化为条件。
+                val systemPipe = runtime.pipefall
                 systemPipe.writeBackendTarget(
                     address = IPv4Address(settings.host),
                     route = NetRoute(scheme = settings.scheme, port = settings.port)
                 )
                 runtime.api.onupdate(systemPipe)
+                runtime.waitgroup.ageUnregistered(force = true)
                 insightPanelAddress = settings.insightPanelAddress
                 insightFirstRoute = settings.insightFirstRoute
                 insightSecondRoute = settings.insightSecondRoute
                 writeInsightPanelAddress(context, settings.insightPanelAddress)
                 writeInsightRoutes(context, settings.insightFirstRoute, settings.insightSecondRoute)
                 std.save(context.applicationContext)
-                Toast.makeText(context, "设置已保存", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    context,
+                    "设置已保存，已触发老化记录清理",
+                    Toast.LENGTH_SHORT
+                ).show()
                 backendDialogOpen = false
             }
         )
@@ -719,24 +793,27 @@ private fun UIKitInsightLayer(
         }
     }
 
+    val waitGroup = remember(insight) { std.run().waitgroup }
+    var waitGroupLength by remember(insight) { mutableStateOf(waitGroup.len()) }
     LaunchedEffect(insight) {
-        val waitGroup = std.run().waitgroup
-        waitGroup.lenUpdates.collect { waitGroupLength ->
-            applyUIKitWaitGroupCorrection(insight, waitGroupLength)
+        waitGroup.lenUpdates.collect { emittedLength ->
+            waitGroupLength = emittedLength.coerceAtLeast(0)
         }
     }
 
     AndroidView(
         modifier = modifier,
         factory = { viewContext ->
-            FrameLayout(viewContext).apply {
+            UIKitInsightHostView(viewContext).apply {
                 layoutParams = ViewGroup.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT
                 )
-                insight.Display(viewContext, this)
-                applyUIKitWaitGroupCorrection(insight, std.run().waitgroup.len())
+                renderUIKitInsight(insight, this, waitGroupLength)
             }
+        },
+        update = { host ->
+            renderUIKitInsight(insight, host, waitGroupLength)
         }
     )
 }
@@ -757,8 +834,8 @@ private fun ScannerPreviewCard(
     val scanPlayer = remember { MediaPlayer.create(context, R.raw.tingko) }
     val scannerGunFocusRequester = remember { FocusRequester() }
     var scannerGunText by remember { mutableStateOf("") }
-    val scanGate = remember {
-        ScannerGate<String> { result ->
+    val scanGate = remember(context) {
+        ScannerGate<String>(context) { result ->
             scope.launch {
                 onScanned(result)
                 scanFeedback(context, scanPlayer)
@@ -1469,7 +1546,7 @@ private fun CustomerDialog(
         },
         confirmButton = {
             Button(
-                enabled = customer.querying || customer.blockReason == null,
+                enabled = !customer.querying || backgroundApprovalAvailable,
                 onClick = onDone,
                 colors = DialogButtonColors
             ) {

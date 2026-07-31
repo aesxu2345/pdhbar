@@ -92,9 +92,6 @@ fun BreakfastApp() {
                         Button(onClick = { std.run().uifurge.onScanInput(orderCode) }) {
                             Text("模拟扫码")
                         }
-                        OutlinedButton(onClick = { std.run().uifurge.onBreakfastDoneClick(orderCode) }) {
-                            Text("完成早餐")
-                        }
                     }
                 }
             }
@@ -106,8 +103,8 @@ fun BreakfastApp() {
     customer?.let { data ->
         CustomerDialog(
             customer = data,
-            onDone = { std.run().uifurge.onBreakfastDoneClick(data.orderCode) },
-            onCancelBreakfast = { std.run().uifurge.onBreakfastCancelClick(data.orderCode) },
+            onDone = { std.run().uifurge.onApproveBreakfastClick(data.orderCode) },
+            onCancelBreakfast = { std.run().uifurge.onCancelEnrollmentClick(data.orderCode) },
             onDismiss = { std.run().uifurge.onDialogCancelClick() }
         )
     }

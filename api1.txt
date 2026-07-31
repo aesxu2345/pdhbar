@@ -24,7 +24,7 @@ card_no     可选，卡号；有就传，没有可不传
     "package_name_b64": "5L2T5qOA5aWX6aSQ",
     "exam_type_b64": "5YWl6IGM5L2T5qOA",
     "organization_name_b64": "5p+Q5p+Q5YWs5Y+4",
-    "exam_total_price": "680.00", // 可选：体检总价字符串，不使用浮点数
+    "exam_total_price_b64": "NjgwLjAw", // 可选：UTF-8 体检总价字符串 "680.00" 的 Base64
     "has_breakfast": true,
     "allow_breakfast": true,
     "breakfast_status": 0,
@@ -47,7 +47,7 @@ card_no     可选，卡号；有就传，没有可不传
     "package_name_b64": "5L2T5qOA5aWX6aSQ",
     "exam_type_b64": "5YWl6IGM5L2T5qOA",
     "organization_name_b64": "5p+Q5p+Q5YWs5Y+4",
-    "exam_total_price": "680.00", // 可选：体检总价字符串，不使用浮点数
+    "exam_total_price_b64": "NjgwLjAw", // 可选：UTF-8 体检总价字符串 "680.00" 的 Base64
     "has_breakfast": false,
     "allow_breakfast": false,
     "breakfast_status": 0,
@@ -96,9 +96,10 @@ organization_name_b64
     可选。单位名称，UTF-8 后 Base64
     缺失、为空或 Base64 无效时，不影响其他客户字段解析
 
-exam_total_price
-    可选。体检总价字符串，非负十进制格式且最多两位小数
-    客户端始终按字符串处理，不转换为 Float 或 Double；缺失或格式无效时不影响其他客户字段解析
+exam_total_price_b64
+    可选。UTF-8 体检总价字符串的标准 Base64；例如 680.00 编码为 NjgwLjAw
+    客户端解码后校验为非负十进制格式且最多两位小数，始终按字符串处理，不转换为 Float 或 Double
+    缺失、Base64 无效或解码后格式无效时不影响其他客户字段解析
 
 体检字段缺失展示
     完整查询响应中，上述任一可选字段缺失或无效时，审批弹窗在该字段位置显示绿色“记录缺失，请人工核对”
@@ -164,7 +165,7 @@ data class BreakfastRightData(
     val package_name_b64: String?,
     val exam_type_b64: String?,
     val organization_name_b64: String?,
-    val exam_total_price: String?,
+    val exam_total_price_b64: String?,
     val has_breakfast: Boolean?,
     val allow_breakfast: Boolean,
     val breakfast_status: Int,

@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -27,6 +28,9 @@ private const val WAIT_GROUP_SNAPSHOT = "ring_snapshot"
 private const val WAIT_GROUP_TAG = "BreakfastWaitGroup"
 private const val WAIT_GROUP_RETRY_DELAY_MS = 3_000L
 private const val WAIT_GROUP_MAX_AGE_MS = 90L * 24L * 60L * 60L * 1_000L
+private const val WAIT_GROUP_UNREGISTERED_MAX_AGE_MS = 10L * 60L * 1_000L
+private const val WAIT_GROUP_AGING_TICK_MS = 30_000L
+private const val WAIT_GROUP_AGING_BATCH_SIZE = 10
 
 /** Serializable descriptors; executable closures are rebuilt by the injected executor. */
 enum class WaitGroupTask(val value: Int) {
@@ -40,14 +44,28 @@ enum class WaitGroupTask(val value: Int) {
     }
 }
 
+enum class ApprovalQueueAction {
+    ApproveBreakfast,
+    CancelEnrollment;
+
+    internal fun toTask(): WaitGroupTask = when (this) {
+        ApproveBreakfast -> WaitGroupTask.Enroll
+        CancelEnrollment -> WaitGroupTask.CancelEnrollment
+    }
+}
+
 enum class WaitApprovalState(val value: Int) {
     Blocked(0),
     Approved(1),
-    Pending(2);
+    Pending(2),
+    Aged(4);
 
     companion object {
-        fun from(value: Int): WaitApprovalState = entries.firstOrNull { it.value == value }
-            ?: throw IllegalArgumentException("unknown wait approval state: $value")
+        fun from(value: Int): WaitApprovalState = when {
+            value >= Aged.value -> Aged
+            else -> entries.firstOrNull { it.value == value }
+                ?: throw IllegalArgumentException("unknown wait approval state: $value")
+        }
     }
 }
 
@@ -65,6 +83,11 @@ data class WaitGroupExecutionResult(
     val message: String? = null
 )
 
+data class AgedUnregisteredRequest(
+    val orderCode: String,
+    val createdAtEpochMs: Long
+)
+
 enum class WaitGroupOutcome { Completed, Failed, AgedOut }
 
 data class WaitGroupOutput(
@@ -80,11 +103,12 @@ interface WaitGroupIO {
     val lenUpdates: StateFlow<Int>
     suspend fun push(
         orderCode: String,
-        task: WaitGroupTask,
+        action: ApprovalQueueAction,
         approvalState: WaitApprovalState = WaitApprovalState.Pending
     ): Boolean
     fun len(): Int
     fun enroll()
+    fun ageUnregistered(force: Boolean = false)
     fun persist()
 }
 
@@ -96,7 +120,8 @@ interface WaitGroupIO {
  */
 class WaitGroupBuffer(
     context: Context,
-    private val executor: suspend (WaitGroupRequest) -> WaitGroupExecutionResult
+    private val executor: suspend (WaitGroupRequest) -> WaitGroupExecutionResult,
+    private val agedUnregisteredExecutor: suspend (List<AgedUnregisteredRequest>) -> WaitGroupExecutionResult
 ) : WaitGroupIO {
     private val appContext = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -116,24 +141,29 @@ class WaitGroupBuffer(
 
     override suspend fun push(
         orderCode: String,
-        task: WaitGroupTask,
+        action: ApprovalQueueAction,
         approvalState: WaitApprovalState
     ): Boolean {
         if (orderCode.isBlank()) return false
         val active = resolveWaitGroup()
         val accepted = try {
-            active.push(orderCode, task, approvalState)
+            active.push(orderCode, action, approvalState)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
             Log.e(WAIT_GROUP_TAG, "wait group push failed; replacing delegate", error)
             false
         }
-        if (accepted) return true
+        if (accepted) {
+            length.value = active.len()
+            return true
+        }
 
         val replacement = replaceFailedWaitGroup(active)
         return try {
-            replacement.push(orderCode, task, approvalState)
+            replacement.push(orderCode, action, approvalState).also { replacementAccepted ->
+                if (replacementAccepted) length.value = replacement.len()
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
@@ -148,11 +178,19 @@ class WaitGroupBuffer(
         withResolvedWaitGroup("enroll", Unit) { it.enroll() }
     }
 
+    override fun ageUnregistered(force: Boolean) {
+        withResolvedWaitGroup("ageUnregistered", Unit) { it.ageUnregistered(force) }
+    }
+
     override fun persist() {
         withResolvedWaitGroup("persist", Unit) { it.persist() }
     }
 
-    private fun createWaitGroup(): WaitGroup = WaitGroup(appContext, executor)
+    private fun createWaitGroup(): WaitGroup = WaitGroup(
+        context = appContext,
+        executor = executor,
+        agedUnregisteredExecutor = agedUnregisteredExecutor
+    )
 
     private fun resolveWaitGroup(): WaitGroup {
         waitGroupDeclaration()?.let { return it }
@@ -218,31 +256,47 @@ class WaitGroupBuffer(
                 if (waitGroupDeclaration() === target) length.value = value
             }
         }
+        scope.launch {
+            while (waitGroupDeclaration() === target) {
+                delay(WAIT_GROUP_AGING_TICK_MS)
+                if (waitGroupDeclaration() === target) target.ageUnregistered()
+            }
+        }
     }
 }
 
-/** Persistent round-robin queue. All mutations are serialized by the actor. */
+/** Persistent round-robin queue. Mutations are actor-serialized and intentionally lock-free. */
 class WaitGroup(
     context: Context,
-    private val executor: suspend (WaitGroupRequest) -> WaitGroupExecutionResult
+    private val executor: suspend (WaitGroupRequest) -> WaitGroupExecutionResult,
+    private val agedUnregisteredExecutor: suspend (List<AgedUnregisteredRequest>) -> WaitGroupExecutionResult
 ) : WaitGroupIO {
     private data class Node(
         val id: String,
-        val request: WaitGroupRequest,
+        var request: WaitGroupRequest,
         val createdAtEpochMs: Long,
         var approvalState: WaitApprovalState,
         var approvalResponseText: String? = null,
         var awaitingAction: Boolean = false,
+        var pendingStatusTask: WaitGroupTask? = null,
         var nextAttemptAtEpochMs: Long = 0L,
         var next: Node? = null
     )
 
     private sealed interface Command {
-        data class Push(val request: WaitGroupRequest) : Command
+        data class Push(
+            val request: WaitGroupRequest,
+            val insertedLength: CompletableDeferred<Int>
+        ) : Command
         data class Finished(
             val nodeId: String,
             val result: WaitGroupExecutionResult,
             val approvalProbe: Boolean = false
+        ) : Command
+        data class AgeUnregistered(val force: Boolean) : Command
+        data class AgingFinished(
+            val nodeIds: List<String>,
+            val result: WaitGroupExecutionResult
         ) : Command
         data object Persist : Command
         data object Wake : Command
@@ -263,29 +317,38 @@ class WaitGroup(
     private var revision = 0L
     private var lastSnapshotHash = ""
     private var processingNodeId: String? = null
+    private var agingNodeIds: Set<String> = emptySet()
+    private var agingBudget = 0
+    private var forceAging = false
     private var wakeScheduled = false
     @Volatile private var enrolled = false
 
     init {
         restore()
-        length.value = size
+        length.value = ringSize()
         scope.launch { actorLoop() }
     }
 
     override suspend fun push(
         orderCode: String,
-        task: WaitGroupTask,
+        action: ApprovalQueueAction,
         approvalState: WaitApprovalState
     ): Boolean {
         val normalized = orderCode.trim()
         if (normalized.isEmpty()) return false
+        val insertedLength = CompletableDeferred<Int>()
         val result = commands.trySend(
-            Command.Push(WaitGroupRequest(normalized, task, approvalState))
+            Command.Push(
+                WaitGroupRequest(normalized, action.toTask(), approvalState),
+                insertedLength
+            )
         )
         if (result.isFailure) {
             Log.e(WAIT_GROUP_TAG, "push rejected because wait group is closed: orderCode=$normalized")
+            return false
         }
-        return result.isSuccess
+        insertedLength.await()
+        return true
     }
 
     override fun len(): Int = length.value
@@ -293,6 +356,10 @@ class WaitGroup(
     override fun enroll() {
         enrolled = true
         commands.trySend(Command.Wake)
+    }
+
+    override fun ageUnregistered(force: Boolean) {
+        commands.trySend(Command.AgeUnregistered(force))
     }
 
     override fun persist() {
@@ -306,27 +373,81 @@ class WaitGroup(
 
     private suspend fun actorLoop() {
         while (scope.isActive) {
-            when (val command = commands.receive()) {
-                is Command.Push -> {
-                    insertOrCompact(command.request)
-                    persistIfChanged()
+            val command = commands.receive()
+            try {
+                when (command) {
+                    is Command.Push -> {
+                        insertOrCompact(command.request)
+                        persistIfChanged()
+                        command.insertedLength.complete(ringSize())
+                    }
+                    is Command.Finished -> finish(command)
+                    is Command.AgeUnregistered -> {
+                        agingBudget = WAIT_GROUP_AGING_BATCH_SIZE
+                        forceAging = forceAging || command.force
+                    }
+                    is Command.AgingFinished -> finishAging(command)
+                    Command.Persist -> persistIfChanged(force = true)
+                    Command.Wake -> wakeScheduled = false
+                    Command.Stop -> {
+                        persistIfChanged(force = true)
+                        commands.close()
+                        return
+                    }
                 }
-                is Command.Finished -> finish(command)
-                Command.Persist -> persistIfChanged(force = true)
-                Command.Wake -> wakeScheduled = false
-                Command.Stop -> {
-                    persistIfChanged(force = true)
-                    commands.close()
-                    return
+                scheduleNext()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                // Queue work is best-effort: retain the ring and wait for the next command/tick.
+                Log.e(WAIT_GROUP_TAG, "ring command ignored after failure: $command", error)
+                if (command is Command.Push && !command.insertedLength.isCompleted) {
+                    command.insertedLength.complete(ringSize())
                 }
             }
-            scheduleNext()
         }
     }
 
     private fun scheduleNext() {
-        if (!enrolled || processingNodeId != null) return
+        if (!enrolled || processingNodeId != null || agingNodeIds.isNotEmpty()) return
         val now = System.currentTimeMillis()
+        val agedUnregistered = if (agingBudget > 0) {
+            nodes().filter {
+                // Only an answered query awaiting operator action is an
+                // unregistered scan. Enroll/CancelEnrollment are status-change
+                // commands and must never enter an unregistered-scan batch.
+                it.request.task == WaitGroupTask.QueryBreakfastRight &&
+                    it.awaitingAction &&
+                    (forceAging || now - it.createdAtEpochMs >= WAIT_GROUP_UNREGISTERED_MAX_AGE_MS)
+            }.take(agingBudget)
+        } else {
+            emptyList()
+        }
+        if (agedUnregistered.isNotEmpty()) {
+            agingBudget = 0
+            forceAging = false
+            val nodeIds = agedUnregistered.map(Node::id)
+            agingNodeIds = nodeIds.toSet()
+            val records = agedUnregistered.map {
+                AgedUnregisteredRequest(it.request.orderCode, it.createdAtEpochMs)
+            }
+            scope.launch {
+                val result = try {
+                    agedUnregisteredExecutor(records)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Throwable) {
+                    WaitGroupExecutionResult(
+                        completed = false,
+                        message = error.message ?: error.javaClass.simpleName
+                    )
+                }
+                commands.trySend(Command.AgingFinished(nodeIds, result))
+            }
+            return
+        }
+        if (agingBudget > 0) agingBudget = 0
+        forceAging = false
         val pendingNodes = nodes().filter { !it.awaitingAction }
         val node = pendingNodes.firstOrNull { it.nextAttemptAtEpochMs <= now }
         if (node == null) {
@@ -340,7 +461,7 @@ class WaitGroup(
             }
             return
         }
-        current = node
+        setCurrent(node)
         if (System.currentTimeMillis() - node.createdAtEpochMs >= WAIT_GROUP_MAX_AGE_MS) {
             processingNodeId = node.id
             commands.trySend(
@@ -383,6 +504,32 @@ class WaitGroup(
         }
     }
 
+    private fun finishAging(command: Command.AgingFinished) {
+        agingNodeIds = emptySet()
+        if (command.result.completed && command.result.success) {
+            command.nodeIds.mapNotNull(::find).forEach { node ->
+                // Defensive task check: cancellation/status-change nodes must bypass
+                // /upload_unregistered_scan even if a stale command contains their id.
+                if (node.request.task != WaitGroupTask.QueryBreakfastRight || !node.awaitingAction) {
+                    Log.w(WAIT_GROUP_TAG, "non-query node bypassed aging upload result task=${node.request.task}")
+                    return@forEach
+                }
+                node.approvalState = WaitApprovalState.Aged
+                val removed = remove(node)
+                Log.i(
+                    WAIT_GROUP_TAG,
+                    "aged query uploaded and dequeued=$removed orderCode=${node.request.orderCode} length=$size"
+                )
+            }
+            persistIfChanged()
+        } else {
+            Log.w(
+                WAIT_GROUP_TAG,
+                "aged query batch retained after upload failure: ${command.result.message ?: "unknown"}"
+            )
+        }
+    }
+
     private suspend fun finish(command: Command.Finished) {
         if (processingNodeId != command.nodeId) return
         processingNodeId = null
@@ -404,38 +551,59 @@ class WaitGroup(
         }
         if (command.result.completed) {
             val agedOut = System.currentTimeMillis() - node.createdAtEpochMs >= WAIT_GROUP_MAX_AGE_MS
-            outputs.emit(
-                WaitGroupOutput(
-                    id = node.id,
-                    request = node.request,
-                    outcome = when {
-                        agedOut -> WaitGroupOutcome.AgedOut
-                        command.result.success -> WaitGroupOutcome.Completed
-                        else -> WaitGroupOutcome.Failed
-                    },
-                    result = command.result.copy(
-                        responseText = command.result.responseText ?: node.approvalResponseText
-                    ),
-                    createdAtEpochMs = node.createdAtEpochMs
-                )
+            val completedRequest = node.request
+            val output = WaitGroupOutput(
+                id = node.id,
+                request = completedRequest,
+                outcome = when {
+                    agedOut -> WaitGroupOutcome.AgedOut
+                    command.result.success -> WaitGroupOutcome.Completed
+                    else -> WaitGroupOutcome.Failed
+                },
+                result = command.result.copy(
+                    responseText = command.result.responseText ?: node.approvalResponseText
+                ),
+                createdAtEpochMs = node.createdAtEpochMs
             )
             if (
-                node.request.task == WaitGroupTask.QueryBreakfastRight &&
+                completedRequest.task == WaitGroupTask.QueryBreakfastRight &&
                 command.result.success &&
                 !agedOut
             ) {
-                node.approvalState = command.result.responseText
+                val resolvedState = command.result.responseText
                     ?.let(::parseApprovalState)
                     ?: WaitApprovalState.Pending
+                node.approvalState = resolvedState
                 node.approvalResponseText = command.result.responseText
-                node.awaitingAction = true
+                val pendingStatusTask = node.pendingStatusTask
+                if (pendingStatusTask == null) {
+                    node.awaitingAction = true
+                } else {
+                    // A background approval arrived while this query was in flight.
+                    // Convert the same ring node instead of inserting a second node.
+                    node.request = WaitGroupRequest(
+                        orderCode = completedRequest.orderCode,
+                        task = pendingStatusTask,
+                        approvalState = resolvedState
+                    )
+                    node.pendingStatusTask = null
+                    node.awaitingAction = false
+                    node.nextAttemptAtEpochMs = 0L
+                }
                 current = node.next
                 revision += 1
                 persistIfChanged()
             } else {
-                remove(node)
+                val lengthBeforeRemoval = size
+                val removed = remove(node)
                 persistIfChanged()
+                Log.i(
+                    WAIT_GROUP_TAG,
+                    "completed node dequeued=$removed task=${node.request.task} " +
+                        "orderCode=${node.request.orderCode} length=$lengthBeforeRemoval->$size"
+                )
             }
+            outputs.emit(output)
         } else {
             current = node.next
             node.nextAttemptAtEpochMs = System.currentTimeMillis() + WAIT_GROUP_RETRY_DELAY_MS
@@ -450,6 +618,19 @@ class WaitGroup(
         var resolvedState = request.approvalState
         var approvalResponseText: String? = null
         if (request.task != WaitGroupTask.QueryBreakfastRight) {
+            val inFlightQuery = matches.firstOrNull {
+                it.request.task == WaitGroupTask.QueryBreakfastRight && it.id == processingNodeId
+            }
+            if (inFlightQuery != null) {
+                inFlightQuery.pendingStatusTask = request.task
+                revision += 1
+                Log.i(
+                    WAIT_GROUP_TAG,
+                    "status intent attached to in-flight query without growing ring: " +
+                        "orderCode=${request.orderCode} task=${request.task} length=$size"
+                )
+                return
+            }
             matches.filter {
                 it.request.task == WaitGroupTask.QueryBreakfastRight && it.id != processingNodeId
             }.forEach {
@@ -502,8 +683,8 @@ class WaitGroup(
 
     private fun find(id: String): Node? = nodes().firstOrNull { it.id == id }
 
-    private fun remove(target: Node) {
-        val cursor = current ?: return
+    private fun remove(target: Node): Boolean {
+        val cursor = current ?: return false
         if (size == 1 && cursor === target) {
             current = null
             size = 0
@@ -520,10 +701,11 @@ class WaitGroup(
                     previous = previous.next ?: previous
                 }
             }
-            if (!removed) return
+            if (!removed) return false
         }
         revision += 1
         length.value = size
+        return true
     }
 
     private fun nodes(): List<Node> {
@@ -548,13 +730,20 @@ class WaitGroup(
                 put("approval_response", node.approvalResponseText)
                 put("created_at", node.createdAtEpochMs)
                 put("awaiting_action", node.awaitingAction)
+                put("pending_status_task", node.pendingStatusTask?.value ?: JSONObject.NULL)
             })
         }
         return JSONObject().apply {
-            put("schema", 5)
+            put("schema", 6)
             put("revision", revision)
             put("nodes", records)
         }.toString()
+    }
+
+    private fun ringSize(): Int = size
+
+    private fun setCurrent(node: Node?) {
+        current = node
     }
 
     private fun persistIfChanged(force: Boolean = false) {
@@ -564,16 +753,18 @@ class WaitGroup(
         if (preferences.edit().putString(WAIT_GROUP_SNAPSHOT, snapshot).commit()) {
             lastSnapshotHash = hash
         } else {
-            Log.e(WAIT_GROUP_TAG, "failed to persist ring revision=$revision")
+            Log.e(WAIT_GROUP_TAG, "failed to persist ring revision=${ringRevision()}")
         }
     }
+
+    private fun ringRevision(): Long = revision
 
     private fun restore() {
         val raw = preferences.getString(WAIT_GROUP_SNAPSHOT, null) ?: return
         runCatching {
             val root = JSONObject(raw)
             val schema = root.optInt("schema")
-            require(schema in 1..5)
+            require(schema in 1..6)
             revision = root.optLong("revision")
             val records = root.getJSONArray("nodes")
             var last: Node? = null
@@ -583,6 +774,13 @@ class WaitGroup(
                     WaitGroupTask.from(item.getInt("task"))
                 } else {
                     WaitGroupTask.QueryBreakfastRight
+                }
+                if (task == WaitGroupTask.QueryBreakfastRight) {
+                    Log.w(
+                        WAIT_GROUP_TAG,
+                        "discarding legacy query node; queue ingress now requires an approval action"
+                    )
+                    return@repeat
                 }
                 val node = Node(
                     id = item.getString("id"),
@@ -598,14 +796,19 @@ class WaitGroup(
                     } else {
                         null
                     },
-                    awaitingAction = schema >= 3 && item.optBoolean("awaiting_action")
+                    awaitingAction = schema >= 3 && item.optBoolean("awaiting_action"),
+                    pendingStatusTask = if (schema >= 6 && !item.isNull("pending_status_task")) {
+                        WaitGroupTask.from(item.getInt("pending_status_task"))
+                    } else {
+                        null
+                    }
                 )
                 if (current == null) current = node else last?.next = node
                 last = node
                 size += 1
             }
             if (current != null) last?.next = current
-            lastSnapshotHash = if (schema == 5) raw.sha256() else ""
+            lastSnapshotHash = if (schema == 6) raw.sha256() else ""
         }.onFailure {
             current = null
             size = 0

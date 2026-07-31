@@ -63,7 +63,7 @@ The response is expected to contain a payload similar to:
     "package_name_b64": "5L2T5qOA5aWX6aSQ", // 套餐名称，UTF-8 Base64
     "exam_type_b64": "5YWl6IGM5L2T5qOA", // 可选：体检类型，UTF-8 Base64
     "organization_name_b64": "5p+Q5p+Q5YWs5Y+4", // 可选：单位名称，UTF-8 Base64
-    "exam_total_price": "680.00", // 可选：体检总价字符串，不使用浮点数
+    "exam_total_price_b64": "NjgwLjAw", // 可选：UTF-8 体检总价字符串 "680.00" 的 Base64
     "has_breakfast": true, // 展示字段
     "allow_breakfast": true, // 早餐权益判定字段
     "breakfast_status": 0, // 早餐登记状态
@@ -75,7 +75,7 @@ The response is expected to contain a payload similar to:
 ### Optional examination fields
 - `exam_type_b64` optionally contains the UTF-8 examination type encoded as Base64.
 - `organization_name_b64` optionally contains the UTF-8 organization name encoded as Base64.
-- `exam_total_price` is an optional non-negative decimal string with at most two decimal places. It is never parsed as a floating-point number.
+- `exam_total_price_b64` optionally contains a non-negative decimal string with at most two decimal places encoded as UTF-8 Base64. After decoding, it remains a string and is never parsed as a floating-point number.
 - Missing, blank, undecodable, or malformed optional examination fields do not reject the remaining customer response.
 - After the query completes, each missing examination field is shown in green at its own dialog position as `记录缺失，请人工核对`.
 
