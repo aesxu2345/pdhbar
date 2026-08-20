@@ -23,3 +23,6 @@ local.properties
 *.sha256
 dist/
 backups/
+test/.venv/
+test/__pycache__/
+test/*.pyc
