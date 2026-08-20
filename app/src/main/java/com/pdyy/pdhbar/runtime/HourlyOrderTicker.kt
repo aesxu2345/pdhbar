@@ -1,5 +1,6 @@
 package com.pdyy.pdhbar.runtime
 
+import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -7,7 +8,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -19,8 +19,6 @@ private const val HOURLY_ORDER_TICKER_TAG = "HourlyOrderTicker"
 private const val HOURLY_ORDER_TICK_MS = 60L * 60L * 1_000L
 private const val ORDER_RANGE_LOOKBACK_SECONDS = 8L * 60L * 60L
 private const val TICKER_NETWORK_RETRY_COUNT = 1
-private const val CACHE_REFILL_BATCH_SIZE = 12
-private const val CACHE_REFILL_REQUEST_GAP_MS = 250L
 private val ORDER_CODE_DATE_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyMMdd")
 
 /**
@@ -30,26 +28,31 @@ private val ORDER_CODE_DATE_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofP
  * Ring mutations remain lock-free here and are serialized by WaitGroup's actor.
  */
 class HourlyOrderTicker(
+    context: Context,
     initialTickerNetTarget: NetTarget,
     private val tickerWaitGroup: WaitGroupIO,
-    private val notifyOperator: (String) -> Unit = {}
+    private val notifyOperator: (String) -> Unit = {},
+    cacheRefillEngineKind: CacheRefillEngineKind = CacheRefillEngineKind.IndexedBounded
 ) {
     private val tickerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val tickerNetTarget = initialTickerNetTarget.copy(retry = TICKER_NETWORK_RETRY_COUNT)
     private val tickerPostman = Postman(tickerNetTarget)
     private val immediateRangeRequests = Channel<Unit>(Channel.CONFLATED)
-    private val cacheRefillRequests = Channel<Unit>(Channel.CONFLATED)
     private var rangeTickerJob: Job? = null
-    private var cacheRefillJob: Job? = null
-    private var cacheRefillCursor = 0
+    private var previouslyHadRecentNode: Boolean? = null
+    private val cacheRefillEngine = CacheRefillEngineFactory.create(
+        kind = cacheRefillEngineKind,
+        context = context.applicationContext,
+        waitGroup = tickerWaitGroup,
+        query = tickerPostman::queryBreakfastRightForTicker,
+        onObserved = ::onIgnoredPoolObserved
+    )
 
     fun start() {
         if (rangeTickerJob?.isActive != true) {
             rangeTickerJob = tickerScope.launch { runRangeTicker() }
         }
-        if (cacheRefillJob?.isActive != true) {
-            cacheRefillJob = tickerScope.launch { runCacheRefillTicker() }
-        }
+        cacheRefillEngine.start()
     }
 
     fun updateBackendTarget(pipefall: PipeFallIO) {
@@ -73,7 +76,7 @@ class HourlyOrderTicker(
                     orderCodeBelongsToDate(it, businessDate)
                 }
                 val insertedCount = tickerWaitGroup.insertIgnoredOrders(orderCodes)
-                if (insertedCount > 0) cacheRefillRequests.trySend(Unit)
+                if (insertedCount > 0) cacheRefillEngine.signal()
                 Log.i(
                     HOURLY_ORDER_TICKER_TAG,
                     "order range applied returned=${returnedOrderCodes.size} " +
@@ -106,27 +109,8 @@ class HourlyOrderTicker(
         }
     }
 
-    private suspend fun runCacheRefillTicker() {
-        var previouslyHadRecentNode: Boolean? = null
-        while (tickerScope.isActive) {
-            val snapshots = try {
-                tickerWaitGroup.ignoredOrderSnapshots()
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                Log.w(HOURLY_ORDER_TICKER_TAG, "state-3 cache observation ignored", error)
-                emptyList()
-            }
-            val nowEpochMs = System.currentTimeMillis()
-            val recentNodes = snapshots.filter {
-                isRecentIgnoredNode(it.createdAtEpochMs, nowEpochMs)
-            }
-            Log.i(
-                HOURLY_ORDER_TICKER_TAG,
-                "state-3 event scan total=${snapshots.size} recent=${recentNodes.size} " +
-                    "missing=${snapshots.count { it.cacheNode == null }} now=$nowEpochMs"
-            )
-            val hasRecentNode = recentNodes.isNotEmpty()
+    private fun onIgnoredPoolObserved(observation: IgnoredPoolObservation) {
+            val hasRecentNode = observation.recentCount > 0
             if (shouldRequestRangeImmediately(previouslyHadRecentNode, hasRecentNode)) {
                 val signalled = immediateRangeRequests.trySend(Unit).isSuccess
                 Log.i(
@@ -139,73 +123,10 @@ class HourlyOrderTicker(
                 (previouslyHadRecentNode == null || previouslyHadRecentNode == false)
             ) {
                 notifyOperator(
-                    "预缓存不刷新：当前仍有${recentNodes.size}条有效状态3记录"
+                    "预缓存不刷新：当前仍有${observation.recentCount}条有效状态3记录"
                 )
             }
             previouslyHadRecentNode = hasRecentNode
-
-            val missingNodes = snapshots.filter { it.cacheNode == null }
-            val refillBatch = selectRefillBatch(
-                nodes = missingNodes,
-                startIndex = cacheRefillCursor,
-                limit = CACHE_REFILL_BATCH_SIZE
-            )
-            cacheRefillCursor = refillBatch.nextIndex
-
-            refillBatch.nodes.forEachIndexed { index, node ->
-                try {
-                    val result = tickerPostman.queryBreakfastRightForTicker(node.orderCode)
-                    val cacheNode = if (result.completed && result.success) {
-                        result.responseText?.let(::parseBreakfastRightCacheNode)
-                    } else {
-                        null
-                    }
-                    if (cacheNode != null && cacheNode.orderCode == node.orderCode) {
-                        try {
-                            // Pessimistic write: overwrite regardless of the value currently stored.
-                            val updated = tickerWaitGroup.overwriteIgnoredCache(
-                                nodeId = node.nodeId,
-                                orderCode = node.orderCode,
-                                cacheNode = cacheNode
-                            )
-                            Log.i(
-                                HOURLY_ORDER_TICKER_TAG,
-                                "state-3 cache refill orderCode=${node.orderCode} updated=$updated " +
-                                    "response=${result.responseText}"
-                            )
-                        } catch (cancelled: CancellationException) {
-                            throw cancelled
-                        } catch (error: Throwable) {
-                            Log.w(
-                                HOURLY_ORDER_TICKER_TAG,
-                                "state-3 cache write failed orderCode=${node.orderCode}",
-                                error
-                            )
-                        }
-                    } else {
-                        Log.w(
-                            HOURLY_ORDER_TICKER_TAG,
-                            "state-3 cache refill rejected orderCode=${node.orderCode} " +
-                                "completed=${result.completed} success=${result.success} " +
-                                "response=${result.responseText} message=${result.message}"
-                        )
-                    }
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (error: Throwable) {
-                    Log.d(
-                        HOURLY_ORDER_TICKER_TAG,
-                        "cache refill will retry orderCode=${node.orderCode}: ${error.message}"
-                    )
-                }
-                if (index < refillBatch.nodes.lastIndex) delay(CACHE_REFILL_REQUEST_GAP_MS)
-            }
-            // No 100ms full-ring polling. New range data wakes this worker; an hourly timeout is
-            // only a low-cost recovery path for failed requests and cache expiration.
-            withTimeoutOrNull(HOURLY_ORDER_TICK_MS) {
-                cacheRefillRequests.receive()
-            }
-        }
     }
 }
 

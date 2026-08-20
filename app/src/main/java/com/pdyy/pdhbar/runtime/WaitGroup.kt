@@ -94,7 +94,8 @@ data class BreakfastRightCacheNode(
     val hasBreakfast: Boolean? = null,
     val allowBreakfast: Boolean? = null,
     val breakfastStatus: Int? = null,
-    val reasonB64: String? = null
+    val reasonB64: String? = null,
+    val cacheIndex: Long = 0L
 )
 
 data class WaitGroupExecutionResult(
@@ -119,7 +120,8 @@ data class IgnoredOrderSnapshot(
     val nodeId: String,
     val orderCode: String,
     val cacheNode: BreakfastRightCacheNode?,
-    val createdAtEpochMs: Long
+    val createdAtEpochMs: Long,
+    val cacheIndex: Long
 )
 
 enum class WaitGroupOutcome { Completed, Failed, AgedOut }
@@ -360,7 +362,8 @@ class WaitGroup(
         var awaitingAction: Boolean = false,
         var pendingStatusTask: WaitGroupTask? = null,
         var nextAttemptAtEpochMs: Long = 0L,
-        var next: Node? = null
+        var next: Node? = null,
+        val cacheIndex: Long = 0L
     )
 
     private sealed interface Command {
@@ -424,6 +427,7 @@ class WaitGroup(
     private var current: Node? = null
     private var size = 0
     private var revision = 0L
+    private var nextCacheIndex = 1L
     private var lastSnapshotHash = ""
     private var processingNodeId: String? = null
     private var agingNodeIds: Set<String> = emptySet()
@@ -615,7 +619,8 @@ class WaitGroup(
                                 it.id,
                                 it.request.orderCode,
                                 it.cacheNode,
-                                it.createdAtEpochMs
+                                it.createdAtEpochMs,
+                                it.cacheIndex
                             )
                         })
                     }
@@ -630,7 +635,8 @@ class WaitGroup(
                                     it.id,
                                     it.request.orderCode,
                                     it.cacheNode,
-                                    it.createdAtEpochMs
+                                    it.createdAtEpochMs,
+                                    it.cacheIndex
                                 )
                             }
                         })
@@ -643,8 +649,9 @@ class WaitGroup(
                             command.cacheNode.orderCode == command.orderCode
                         if (updated) {
                             // Deliberately overwrite without checking the current value.
-                            node!!.cacheNode = command.cacheNode
-                            writeCacheIndex(command.cacheNode)
+                            val indexedCache = command.cacheNode.copy(cacheIndex = node!!.cacheIndex)
+                            node.cacheNode = indexedCache
+                            writeCacheIndex(indexedCache)
                         }
                         command.updated.complete(updated)
                     }
@@ -977,7 +984,10 @@ class WaitGroup(
             System.currentTimeMillis(),
             request.approvalState,
             cacheNode,
-            approvalResponseText
+            approvalResponseText,
+            cacheIndex = if (request.approvalState == WaitApprovalState.Ignored) {
+                allocateCacheIndex()
+            } else 0L
         )
         val cursor = current
         if (cursor == null) {
@@ -1073,6 +1083,7 @@ class WaitGroup(
                 put("order_code", node.request.orderCode)
                 put("task", node.request.task.value)
                 put("approval_state", node.approvalState.value)
+                if (node.cacheIndex > 0L) put("cache_index", node.cacheIndex)
                 put("approval_response", node.approvalResponseText)
                 put("created_at", node.createdAtEpochMs)
                 put("awaiting_action", node.awaitingAction)
@@ -1080,8 +1091,9 @@ class WaitGroup(
             })
         }
         return JSONObject().apply {
-            put("schema", 9)
+            put("schema", 10)
             put("revision", revision)
+            put("next_cache_index", nextCacheIndex)
             put("nodes", records)
         }.toString()
     }
@@ -1110,9 +1122,12 @@ class WaitGroup(
         runCatching {
             val root = JSONObject(raw)
             val schema = root.optInt("schema")
-            require(schema in 1..9)
+            require(schema in 1..10)
             val migratedCacheTimestamp = System.currentTimeMillis()
             revision = root.optLong("revision")
+            nextCacheIndex = if (schema >= 10) {
+                root.optLong("next_cache_index", 1L).coerceAtLeast(1L)
+            } else 1L
             val records = root.getJSONArray("nodes")
             var last: Node? = null
             repeat(records.length()) { index ->
@@ -1137,6 +1152,11 @@ class WaitGroup(
                     )
                     return@repeat
                 }
+                val restoredCacheIndex = if (approvalState == WaitApprovalState.Ignored) {
+                    if (schema >= 10) item.optLong("cache_index", 0L)
+                        .takeIf { it > 0L } ?: allocateCacheIndex()
+                    else allocateCacheIndex()
+                } else 0L
                 val node = Node(
                     id = item.getString("id"),
                     request = WaitGroupRequest(item.getString("order_code"), task),
@@ -1158,15 +1178,20 @@ class WaitGroup(
                         WaitGroupTask.from(item.getInt("pending_status_task"))
                     } else {
                         null
-                    }
+                    },
+                    cacheIndex = restoredCacheIndex
                 )
+                if (node.cacheNode != null && node.cacheNode!!.cacheIndex != restoredCacheIndex) {
+                    node.cacheNode = node.cacheNode!!.copy(cacheIndex = restoredCacheIndex)
+                    writeCacheIndex(node.cacheNode!!)
+                }
                 if (current == null) current = node else last?.next = node
                 last = node
                 size += 1
             }
             if (current != null) last?.next = current
-            lastSnapshotHash = if (schema == 9) raw.sha256() else ""
-            if (schema in 7..8) persistIfChanged(force = true)
+            lastSnapshotHash = if (schema == 10) raw.sha256() else ""
+            if (schema in 1..9) persistIfChanged(force = true)
         }.onFailure {
             current = null
             size = 0
@@ -1174,6 +1199,8 @@ class WaitGroup(
             Log.e(WAIT_GROUP_TAG, "discarding invalid persisted ring", it)
         }
     }
+
+    private fun allocateCacheIndex(): Long = nextCacheIndex++
 
     private fun readCacheIndex(orderCode: String): BreakfastRightCacheNode? =
         cacheIndexPreferences.getString(orderCode, null)?.let { raw ->
@@ -1222,7 +1249,8 @@ private fun JSONObject.toBreakfastRightCacheNode(
         hasBreakfast = optNullableBoolean("has_breakfast"),
         allowBreakfast = optNullableBoolean("allow_breakfast"),
         breakfastStatus = optNullableInt("breakfast_status"),
-        reasonB64 = optNullableString("reason_b64")
+        reasonB64 = optNullableString("reason_b64"),
+        cacheIndex = optLong("cache_index", 0L).coerceAtLeast(0L)
     )
 }
 
@@ -1243,6 +1271,7 @@ private fun BreakfastRightCacheNode.toJson(): JSONObject = JSONObject().apply {
     putNullable("allow_breakfast", allowBreakfast)
     putNullable("breakfast_status", breakfastStatus)
     putNullable("reason_b64", reasonB64)
+    if (cacheIndex > 0L) put("cache_index", cacheIndex)
 }
 
 internal fun isIgnoredCacheExpired(cachedAtEpochMs: Long, nowEpochMs: Long): Boolean =

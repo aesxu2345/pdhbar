@@ -175,6 +175,7 @@ class std private constructor(
             )
             val tickerNetTarget = target.copy()
             val hourlyOrderTicker = HourlyOrderTicker(
+                context = context.applicationContext,
                 initialTickerNetTarget = tickerNetTarget,
                 tickerWaitGroup = waitgroup,
                 notifyOperator = { message ->
