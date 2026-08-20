@@ -71,7 +71,7 @@ Content-Type: application/json; charset=utf-8
 
 ```json
 {
-  "order_code": "T202607010001",
+  "order_code": "2608130090",
   "card_no": "123456"
 }
 ```
@@ -90,12 +90,12 @@ Content-Type: application/json; charset=utf-8
   "code": 200,
   "msg": "ok",
   "data": {
-    "order_code": "T202607010001",
+    "order_code": "2608130090",
     "card_no": "123456",
     "name_b64": "5byg5LiJ",
     "sex_b64": "55S3",
     "phone": "138****8888",
-    "avatar_url": "/avatars/T202607010001.jpg",
+    "avatar_url": "/avatars/2608130090.jpg",
     "birth_date": "1990-01-01",
     "package_name_b64": "5L2T5qOA5aWX6aSQ",
     "exam_type_b64": "5YWl6IGM5L2T5qOA",
@@ -164,13 +164,13 @@ breakfast_status = 1
 ### 3.2 登记请求
 
 ```http
-GET /change_breakfast_status?order_code=T202607010001&breakfast_status=1&breakfast_remark=PDA%E6%89%AB%E7%A0%81%E6%A0%B8%E9%94%80%E6%97%A9%E9%A4%90
+GET /change_breakfast_status?order_code=2608130090&breakfast_status=1&breakfast_remark=PDA%E6%89%AB%E7%A0%81%E6%A0%B8%E9%94%80%E6%97%A9%E9%A4%90
 ```
 
 ### 3.3 取消请求
 
 ```http
-GET /change_breakfast_status?order_code=T202607010001&breakfast_status=0&breakfast_remark=PDA%E5%8F%96%E6%B6%88%E6%97%A9%E9%A4%90%E6%A0%B8%E9%94%80
+GET /change_breakfast_status?order_code=2608130090&breakfast_status=0&breakfast_remark=PDA%E5%8F%96%E6%B6%88%E6%97%A9%E9%A4%90%E6%A0%B8%E9%94%80
 ```
 
 | 查询参数 | 类型 | 必要性 | 说明 |
@@ -229,11 +229,11 @@ Content-Type: application/json; charset=utf-8
 ```json
 [
   {
-    "order_code": "T202607010001",
+    "order_code": "2608130090",
     "created_at": 1785290000000
   },
   {
-    "order_code": "T202607010002",
+    "order_code": "2608130091",
     "created_at": 1785290001000
   }
 ]
@@ -255,7 +255,7 @@ Content-Type: application/json; charset=utf-8
 }
 ```
 
-只有 HTTP 状态严格为 `200`，且响应中的可选业务 `code` 不存在或等于 `200` 时，客户端才把对应查询节点标记为 `WaitApprovalState.Aged(4)` 并从环形链表摘除。上传失败时整批保留，等待后续老化轮再次提交。
+只有 HTTP 状态严格为 `200`，且响应中的可选业务 `code` 不存在或等于 `200` 时，客户端才把对应查询节点标记为 `WaitApprovalState.Aged(10)` 并从环形链表摘除。上传失败时整批保留，等待后续老化轮再次提交。
 
 ---
 
