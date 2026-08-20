@@ -52,6 +52,7 @@ import kotlin.concurrent.read
 import kotlin.concurrent.write
 
 private const val QUERY_BREAKFAST_RIGHT_PATH = "/query_breakfast_right"
+private const val QUERY_ORDER_CODES_BY_TIME_RANGE_PATH = "/query_order_codes_by_time_range"
 private const val CHANGE_BREAKFAST_STATUS_PATH = "/change_breakfast_status"
 private const val UPLOAD_UNREGISTERED_SCAN_PATH = "/upload_unregistered_scan"
 private const val API_TARGET_PREFS = "breakfast_api_target"
@@ -85,6 +86,7 @@ private const val SUNMI_SCANNER_SERVICE_CLASS = "com.sunmi.scanner.ScannerServic
 
 class std private constructor(
     val api: Postman,
+    val hourlyOrderTicker: HourlyOrderTicker,
     val waitgroup: WaitGroupIO,
     val barscanner: BarScanner,
     val pipefall: PipeFallIO,
@@ -106,6 +108,11 @@ class std private constructor(
 
     fun setScannerGunMode(enabled: Boolean) {
         scannerGunMode = enabled
+    }
+
+    fun updateBackendTarget(pipefall: PipeFallIO) {
+        api.onupdate(pipefall)
+        hourlyOrderTicker.updateBackendTarget(pipefall)
     }
 
     fun attachScannerGunApi(context: Context, onScan: ((String) -> Unit)? = null) {
@@ -166,6 +173,14 @@ class std private constructor(
                     }
                 }
             )
+            val tickerNetTarget = target.copy()
+            val hourlyOrderTicker = HourlyOrderTicker(
+                initialTickerNetTarget = tickerNetTarget,
+                tickerWaitGroup = waitgroup,
+                notifyOperator = { message ->
+                    pipefall.writeCommand(UiCommand.Toast(message))
+                }
+            )
             pipefall.bindWaitGroup(waitgroup)
             val barscanner = NewBarScanner(api = api, pipefall = pipefall)
             val uifurge = UIfurge(pipefall = pipefall)
@@ -173,6 +188,7 @@ class std private constructor(
 
             return std(
                 api = api,
+                hourlyOrderTicker = hourlyOrderTicker,
                 waitgroup = waitgroup,
                 barscanner = barscanner,
                 pipefall = pipefall,
@@ -183,6 +199,7 @@ class std private constructor(
             ).also {
                 buffer = it
                 waitgroup.enroll()
+                hourlyOrderTicker.start()
             }
         }
 
@@ -781,6 +798,70 @@ class Postman(
         }
     }
 
+    suspend fun queryBreakfastRightForTicker(orderCode: String): WaitGroupExecutionResult =
+        executeWaitGroupRequest(
+            WaitGroupRequest(
+                orderCode = orderCode,
+                task = WaitGroupTask.QueryBreakfastRight,
+                approvalState = WaitApprovalState.Ignored
+            )
+        )
+
+    suspend fun queryOrderCodesByTimeRange(
+        startUtcSeconds: Long,
+        endUtcSeconds: Long
+    ): List<String> {
+        require(startUtcSeconds >= 0L && endUtcSeconds > startUtcSeconds)
+        val rangeTarget = targetLock.read {
+            targetState.copy(path = QUERY_ORDER_CODES_BY_TIME_RANGE_PATH)
+        }
+        val body = JSONObject()
+            .put("start_utc", startUtcSeconds)
+            .put("end_utc", endUtcSeconds)
+            .toString()
+        Log.i(
+            RUNTIME_TAG,
+            "range POST request url=${rangeTarget.url()} method=POST " +
+                "contentType=application/json; charset=utf-8"
+        )
+        logCompletePayload(RUNTIME_TAG, "range POST request body", body)
+        val response = withContext(Dispatchers.IO) {
+            executeRawHttp11Post(rangeTarget, body)
+        }
+        Log.i(
+            RUNTIME_TAG,
+            "range POST response startUtc=$startUtcSeconds endUtc=$endUtcSeconds " +
+                "http=${response.statusCode} bodyLength=${response.body.length}"
+        )
+        logCompletePayload(RUNTIME_TAG, "range POST response body", response.body)
+        require(response.statusCode in 200..299) { "HTTP ${response.statusCode}" }
+        val root = JSONObject(response.body)
+        val responseMessage = root.optString("msg").takeIf(String::isNotBlank)
+            ?: root.optString("message").takeIf(String::isNotBlank)
+        Log.i(
+            RUNTIME_TAG,
+            "range POST decoded code=${root.opt("code")} status=${root.opt("status")} " +
+                "msg=${root.optString("msg")} message=${root.optString("message")}"
+        )
+        require(root.optInt("code", Int.MIN_VALUE) == 200) {
+            responseMessage ?: "range query failed"
+        }
+        require(root.optBoolean("status", false)) {
+            responseMessage ?: "range query status is false"
+        }
+        val records = root.optJSONArray("data")
+            ?: throw IllegalArgumentException("missing data")
+        return buildList {
+            repeat(records.length()) { index ->
+                val record = records.optJSONObject(index)
+                    ?: throw IllegalArgumentException("data[$index] is not an object")
+                val orderCode = record.opt("order_code") as? String
+                    ?: throw IllegalArgumentException("data[$index].order_code is not a string")
+                orderCode.trim().takeIf(String::isNotEmpty)?.let(::add)
+            }
+        }.distinct()
+    }
+
     suspend fun uploadAgedUnregistered(
         records: List<AgedUnregisteredRequest>
     ): WaitGroupExecutionResult {
@@ -942,13 +1023,20 @@ class PostJsonAction(
 
             while (attempt <= maxRetry) {
                 try {
+                    Log.i(
+                        RUNTIME_TAG,
+                        "post request url=${target.url()} attempt=${attempt + 1}/${maxRetry + 1} " +
+                            "method=POST contentType=application/json; charset=utf-8"
+                    )
+                    logCompletePayload(RUNTIME_TAG, "post request body", body)
                     val response = executeRawHttp11Post(target, body)
                     responseText = response.body
                     Log.i(
                         RUNTIME_TAG,
                         "post response url=${target.url()} attempt=${attempt + 1}/${maxRetry + 1} " +
-                            "http=${response.statusCode} body=${response.body}"
+                            "http=${response.statusCode} bodyLength=${response.body.length}"
                     )
+                    logCompletePayload(RUNTIME_TAG, "post response body", response.body)
                     val responseJson = runCatching { JSONObject(response.body) }.getOrNull()
                     val businessCode = responseJson
                         ?.takeIf { it.has("code") && !it.isNull("code") }
@@ -1171,7 +1259,8 @@ sealed interface UiCommand {
         val hasBreakfast: Boolean,
         val allowBreakfast: Boolean,
         val blockReason: String?,
-        val querying: Boolean = false
+        val querying: Boolean = false,
+        val preCached: Boolean = false
     ) : UiCommand
 
     data object CloseDialog : UiCommand
@@ -1232,6 +1321,8 @@ class PipeFall(context: Context) : PipeFallIO() {
     private val submissionState = AtomicReference<SubmissionState>(SubmissionState.Idle)
     private val scanStateLockedAt = AtomicLong(0L)
     private val hiddenCustomerQueries = ConcurrentHashMap.newKeySet<String>()
+    private val customerCacheNodes = ConcurrentHashMap<String, BreakfastRightCacheNode>()
+    private val ignoredSourceNodeIds = ConcurrentHashMap<String, String>()
 
     init {
         workerScope.launch {
@@ -1360,6 +1451,29 @@ class PipeFall(context: Context) : PipeFallIO() {
         }
 
         queueBufferScope.launch {
+            val ignoredSnapshot = try {
+                waitGroup?.findIgnoredOrder(orderCode)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                Log.w(RUNTIME_TAG, "ignored cache lookup failed; falling back to POST", error)
+                null
+            }
+            if (ignoredSnapshot != null) {
+                ignoredSourceNodeIds[orderCode] = ignoredSnapshot.nodeId
+                val cached = ignoredSnapshot.cacheNode
+                if (cached != null && cached.orderCode == orderCode) {
+                    customerCacheNodes[orderCode] = cached
+                    showCustomerView(
+                        orderCode,
+                        cached.toBreakfastRightView(),
+                        preCached = true
+                    )
+                    return@launch
+                }
+            } else {
+                ignoredSourceNodeIds.remove(orderCode)
+            }
             val request = WaitGroupRequest(
                 orderCode = orderCode,
                 task = WaitGroupTask.QueryBreakfastRight
@@ -1397,7 +1511,11 @@ class PipeFall(context: Context) : PipeFallIO() {
             finishSubmission("任务队列尚未初始化")
             return
         }
-        if (!pushToWaitGroup(orderCode, action, queue)) {
+        val cacheNode = customerCacheNodes.remove(orderCode)
+        val ignoredSourceNodeId = ignoredSourceNodeIds.remove(orderCode)
+        if (!pushToWaitGroup(orderCode, action, cacheNode, ignoredSourceNodeId, queue)) {
+            if (cacheNode != null) customerCacheNodes[orderCode] = cacheNode
+            if (ignoredSourceNodeId != null) ignoredSourceNodeIds[orderCode] = ignoredSourceNodeId
             finishSubmission("本次操作入队失败，请重试")
             return
         }
@@ -1415,11 +1533,21 @@ class PipeFall(context: Context) : PipeFallIO() {
     private suspend fun pushToWaitGroup(
         orderCode: String,
         action: ApprovalQueueAction,
+        cacheNode: BreakfastRightCacheNode?,
+        ignoredSourceNodeId: String?,
         queue: WaitGroupIO? = waitGroup
     ): Boolean {
         val target = queue ?: return false
         return try {
-            target.push(orderCode, action)
+            target.push(
+                orderCode = orderCode,
+                action = action,
+                approvalState = cacheNode?.allowBreakfast?.let {
+                    if (it) WaitApprovalState.Approved else WaitApprovalState.Blocked
+                } ?: WaitApprovalState.Pending,
+                cacheNode = cacheNode,
+                ignoredSourceNodeId = ignoredSourceNodeId
+            )
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
@@ -1463,7 +1591,8 @@ class PipeFall(context: Context) : PipeFallIO() {
     }
 
     private fun notifyEnrollmentResult(output: WaitGroupOutput) {
-        val customer = output.result.responseText?.let(::parseBreakfastRight)
+        val customer = output.cacheNode?.toBreakfastRightView()
+            ?: output.result.responseText?.let(::parseBreakfastRight)
         val name = customer?.name?.takeIf { it.isNotBlank() && it != "未知客户" }
         val person = name?.let { "（$it）" }.orEmpty()
         val blocked = customer?.allowBreakfast == false ||
@@ -1507,11 +1636,25 @@ class PipeFall(context: Context) : PipeFallIO() {
             writeCommand(UiCommand.Toast(result.message ?: "客户信息查询失败"))
             return
         }
-        val breakfastRight = result.responseText?.let(::parseBreakfastRight)
+        val cacheNode = result.responseText?.let(::parseBreakfastRightCacheNode)
+        val breakfastRight = cacheNode?.toBreakfastRightView()
+            ?: result.responseText?.let(::parseBreakfastRight)
         if (breakfastRight == null) {
             writeCommand(UiCommand.Toast("客户信息解析失败"))
             return
         }
+        if (cacheNode != null && cacheNode.orderCode == orderCode) {
+            customerCacheNodes[orderCode] = cacheNode
+        }
+        showCustomerView(orderCode, breakfastRight)
+    }
+
+    private fun showCustomerView(
+        orderCode: String,
+        breakfastRight: BreakfastRightView,
+        preCached: Boolean = false
+    ) {
+        if (orderCode in hiddenCustomerQueries) return
         val blockReason = breakfastRight.blockReason()
         val resolvedAvatarUrl = std.run().api.target.resolveResourceUrl(breakfastRight.avatarUrl)
         writeCommand(
@@ -1529,7 +1672,8 @@ class PipeFall(context: Context) : PipeFallIO() {
                 examTotalPrice = breakfastRight.examTotalPrice,
                 hasBreakfast = breakfastRight.hasBreakfast,
                 allowBreakfast = breakfastRight.allowBreakfast,
-                blockReason = blockReason
+                blockReason = blockReason,
+                preCached = preCached
             )
         )
     }
@@ -1593,6 +1737,32 @@ private data class BreakfastRightView(
     val allowBreakfast: Boolean,
     val reason: String?
 )
+
+private fun BreakfastRightCacheNode.toBreakfastRightView(): BreakfastRightView = BreakfastRightView(
+    orderCode = orderCode,
+    cardNo = cardNo,
+    name = nameB64.decodeBase64() ?: "未知客户",
+    sex = sexB64.decodeBase64(),
+    phone = phone,
+    avatarUrl = avatarUrl,
+    birthDate = birthDate,
+    packageName = packageNameB64.decodeBase64(),
+    examType = examTypeB64.decodeBase64(),
+    organizationName = organizationNameB64.decodeBase64(),
+    examTotalPrice = examTotalPriceB64.decodeBase64()?.takeIf {
+        Regex("\\d+(?:\\.\\d{1,2})?").matches(it)
+    },
+    hasBreakfast = hasBreakfast ?: false,
+    allowBreakfast = allowBreakfast ?: false,
+    reason = reasonB64.decodeBase64()
+)
+
+private fun String?.decodeBase64(): String? {
+    val encoded = this?.takeIf(String::isNotBlank) ?: return null
+    return runCatching {
+        String(Base64.getDecoder().decode(encoded), Charsets.UTF_8)
+    }.getOrNull()
+}
 
 private fun postApprovalNotification(context: Context, key: String, title: String, text: String) {
     val manager = context.getSystemService(NotificationManager::class.java)
@@ -1680,6 +1850,21 @@ private fun executeHttp(
 private fun readResponse(connection: HttpURLConnection, httpOk: Boolean): String {
     val stream = if (httpOk) connection.inputStream else connection.errorStream
     return stream?.bufferedReader(Charsets.UTF_8)?.use(BufferedReader::readText).orEmpty()
+}
+
+private const val LOGCAT_PAYLOAD_CHUNK_SIZE = 3_000
+
+/** Logs every character without relying on Logcat's per-entry truncation limit. */
+private fun logCompletePayload(tag: String, label: String, payload: String) {
+    if (payload.isEmpty()) {
+        Log.i(tag, "$label [empty]")
+        return
+    }
+    val chunkCount = (payload.length + LOGCAT_PAYLOAD_CHUNK_SIZE - 1) /
+        LOGCAT_PAYLOAD_CHUNK_SIZE
+    payload.chunked(LOGCAT_PAYLOAD_CHUNK_SIZE).forEachIndexed { index, chunk ->
+        Log.i(tag, "$label [${index + 1}/$chunkCount] $chunk")
+    }
 }
 
 private fun executeRawHttp11Post(target: NetTarget, body: String): RawHttpResponse {

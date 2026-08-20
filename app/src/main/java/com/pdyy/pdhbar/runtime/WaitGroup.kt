@@ -25,12 +25,14 @@ import java.util.UUID
 
 private const val WAIT_GROUP_PREFS = "breakfast_wait_group"
 private const val WAIT_GROUP_SNAPSHOT = "ring_snapshot"
+private const val WAIT_GROUP_CACHE_INDEX_PREFS = "breakfast_wait_group_cache_index"
 private const val WAIT_GROUP_TAG = "BreakfastWaitGroup"
 private const val WAIT_GROUP_RETRY_DELAY_MS = 3_000L
 private const val WAIT_GROUP_MAX_AGE_MS = 90L * 24L * 60L * 60L * 1_000L
 private const val WAIT_GROUP_UNREGISTERED_MAX_AGE_MS = 10L * 60L * 1_000L
 private const val WAIT_GROUP_AGING_TICK_MS = 30_000L
 private const val WAIT_GROUP_AGING_BATCH_SIZE = 10
+internal const val IGNORED_CACHE_MAX_AGE_MS = 24L * 60L * 60L * 1_000L
 
 /** Serializable descriptors; executable closures are rebuilt by the injected executor. */
 enum class WaitGroupTask(val value: Int) {
@@ -58,7 +60,8 @@ enum class WaitApprovalState(val value: Int) {
     Blocked(0),
     Approved(1),
     Pending(2),
-    Aged(4);
+    Ignored(3),
+    Aged(10);
 
     companion object {
         fun from(value: Int): WaitApprovalState = when {
@@ -75,6 +78,25 @@ data class WaitGroupRequest(
     val approvalState: WaitApprovalState = WaitApprovalState.Pending
 )
 
+data class BreakfastRightCacheNode(
+    val orderCode: String,
+    val cachedAtEpochMs: Long,
+    val cardNo: String? = null,
+    val nameB64: String? = null,
+    val sexB64: String? = null,
+    val phone: String? = null,
+    val avatarUrl: String? = null,
+    val birthDate: String? = null,
+    val packageNameB64: String? = null,
+    val examTypeB64: String? = null,
+    val organizationNameB64: String? = null,
+    val examTotalPriceB64: String? = null,
+    val hasBreakfast: Boolean? = null,
+    val allowBreakfast: Boolean? = null,
+    val breakfastStatus: Int? = null,
+    val reasonB64: String? = null
+)
+
 data class WaitGroupExecutionResult(
     /** False means a transport failure which remains queued for retry. */
     val completed: Boolean,
@@ -88,6 +110,18 @@ data class AgedUnregisteredRequest(
     val createdAtEpochMs: Long
 )
 
+data class IgnoredCacheNodeRef(
+    val id: String,
+    val orderCode: String
+)
+
+data class IgnoredOrderSnapshot(
+    val nodeId: String,
+    val orderCode: String,
+    val cacheNode: BreakfastRightCacheNode?,
+    val createdAtEpochMs: Long
+)
+
 enum class WaitGroupOutcome { Completed, Failed, AgedOut }
 
 data class WaitGroupOutput(
@@ -95,7 +129,8 @@ data class WaitGroupOutput(
     val request: WaitGroupRequest,
     val outcome: WaitGroupOutcome,
     val result: WaitGroupExecutionResult,
-    val createdAtEpochMs: Long
+    val createdAtEpochMs: Long,
+    val cacheNode: BreakfastRightCacheNode? = null
 )
 
 interface WaitGroupIO {
@@ -104,7 +139,19 @@ interface WaitGroupIO {
     suspend fun push(
         orderCode: String,
         action: ApprovalQueueAction,
-        approvalState: WaitApprovalState = WaitApprovalState.Pending
+        approvalState: WaitApprovalState = WaitApprovalState.Pending,
+        cacheNode: BreakfastRightCacheNode? = null,
+        ignoredSourceNodeId: String? = null
+    ): Boolean
+    suspend fun findIgnoredOrder(orderCode: String): IgnoredOrderSnapshot?
+    suspend fun ignoredOrderSnapshots(): List<IgnoredOrderSnapshot>
+    suspend fun insertIgnoredOrder(orderCode: String): Boolean
+    suspend fun insertIgnoredOrders(orderCodes: List<String>): Int
+    suspend fun ignoredOrdersMissingCache(): List<IgnoredCacheNodeRef>
+    suspend fun overwriteIgnoredCache(
+        nodeId: String,
+        orderCode: String,
+        cacheNode: BreakfastRightCacheNode
     ): Boolean
     fun len(): Int
     fun enroll()
@@ -142,12 +189,14 @@ class WaitGroupBuffer(
     override suspend fun push(
         orderCode: String,
         action: ApprovalQueueAction,
-        approvalState: WaitApprovalState
+        approvalState: WaitApprovalState,
+        cacheNode: BreakfastRightCacheNode?,
+        ignoredSourceNodeId: String?
     ): Boolean {
         if (orderCode.isBlank()) return false
         val active = resolveWaitGroup()
         val accepted = try {
-            active.push(orderCode, action, approvalState)
+            active.push(orderCode, action, approvalState, cacheNode, ignoredSourceNodeId)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Throwable) {
@@ -161,7 +210,13 @@ class WaitGroupBuffer(
 
         val replacement = replaceFailedWaitGroup(active)
         return try {
-            replacement.push(orderCode, action, approvalState).also { replacementAccepted ->
+            replacement.push(
+                orderCode,
+                action,
+                approvalState,
+                cacheNode,
+                ignoredSourceNodeId
+            ).also { replacementAccepted ->
                 if (replacementAccepted) length.value = replacement.len()
             }
         } catch (cancelled: CancellationException) {
@@ -172,10 +227,34 @@ class WaitGroupBuffer(
         }
     }
 
-    override fun len(): Int = withResolvedWaitGroup("len", length.value) { it.len() }
+    override suspend fun insertIgnoredOrder(orderCode: String): Boolean =
+        resolveWaitGroup().insertIgnoredOrder(orderCode)
+
+    override suspend fun insertIgnoredOrders(orderCodes: List<String>): Int =
+        resolveWaitGroup().insertIgnoredOrders(orderCodes)
+
+    override suspend fun findIgnoredOrder(orderCode: String): IgnoredOrderSnapshot? =
+        resolveWaitGroup().findIgnoredOrder(orderCode)
+
+    override suspend fun ignoredOrderSnapshots(): List<IgnoredOrderSnapshot> =
+        resolveWaitGroup().ignoredOrderSnapshots()
+
+    override suspend fun ignoredOrdersMissingCache(): List<IgnoredCacheNodeRef> =
+        resolveWaitGroup().ignoredOrdersMissingCache()
+
+    override suspend fun overwriteIgnoredCache(
+        nodeId: String,
+        orderCode: String,
+        cacheNode: BreakfastRightCacheNode
+    ): Boolean = resolveWaitGroup().overwriteIgnoredCache(nodeId, orderCode, cacheNode)
+
+    override fun len(): Int = length.value
 
     override fun enroll() {
-        withResolvedWaitGroup("enroll", Unit) { it.enroll() }
+        // 启动空实现边界：调用线程只负责投递，真实队列恢复在独立 IO 协程中完成。
+        scope.launch {
+            withResolvedWaitGroup("enroll", Unit) { it.enroll() }
+        }
     }
 
     override fun ageUnregistered(force: Boolean) {
@@ -276,6 +355,7 @@ class WaitGroup(
         var request: WaitGroupRequest,
         val createdAtEpochMs: Long,
         var approvalState: WaitApprovalState,
+        var cacheNode: BreakfastRightCacheNode? = null,
         var approvalResponseText: String? = null,
         var awaitingAction: Boolean = false,
         var pendingStatusTask: WaitGroupTask? = null,
@@ -286,7 +366,33 @@ class WaitGroup(
     private sealed interface Command {
         data class Push(
             val request: WaitGroupRequest,
+            val cacheNode: BreakfastRightCacheNode?,
+            val ignoredSourceNodeId: String?,
             val insertedLength: CompletableDeferred<Int>
+        ) : Command
+        data class InsertIgnoredOrder(
+            val orderCode: String,
+            val inserted: CompletableDeferred<Boolean>
+        ) : Command
+        data class InsertIgnoredOrders(
+            val orderCodes: List<String>,
+            val insertedCount: CompletableDeferred<Int>
+        ) : Command
+        data class ReadIgnoredMissingCache(
+            val result: CompletableDeferred<List<IgnoredCacheNodeRef>>
+        ) : Command
+        data class ReadIgnoredOrder(
+            val orderCode: String,
+            val result: CompletableDeferred<IgnoredOrderSnapshot?>
+        ) : Command
+        data class ReadIgnoredOrders(
+            val result: CompletableDeferred<List<IgnoredOrderSnapshot>>
+        ) : Command
+        data class OverwriteIgnoredCache(
+            val nodeId: String,
+            val orderCode: String,
+            val cacheNode: BreakfastRightCacheNode,
+            val updated: CompletableDeferred<Boolean>
         ) : Command
         data class Finished(
             val nodeId: String,
@@ -305,6 +411,9 @@ class WaitGroup(
 
     private val preferences = context.applicationContext
         .getSharedPreferences(WAIT_GROUP_PREFS, Context.MODE_PRIVATE)
+    /** Internal persistent index; intentionally not exposed through WaitGroupIO/std. */
+    private val cacheIndexPreferences = context.applicationContext
+        .getSharedPreferences(WAIT_GROUP_CACHE_INDEX_PREFS, Context.MODE_PRIVATE)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val commands = Channel<Command>(Channel.UNLIMITED)
     private val outputs = MutableSharedFlow<WaitGroupOutput>(extraBufferCapacity = 64)
@@ -332,7 +441,9 @@ class WaitGroup(
     override suspend fun push(
         orderCode: String,
         action: ApprovalQueueAction,
-        approvalState: WaitApprovalState
+        approvalState: WaitApprovalState,
+        cacheNode: BreakfastRightCacheNode?,
+        ignoredSourceNodeId: String?
     ): Boolean {
         val normalized = orderCode.trim()
         if (normalized.isEmpty()) return false
@@ -340,6 +451,8 @@ class WaitGroup(
         val result = commands.trySend(
             Command.Push(
                 WaitGroupRequest(normalized, action.toTask(), approvalState),
+                cacheNode?.takeIf { it.orderCode == normalized },
+                ignoredSourceNodeId,
                 insertedLength
             )
         )
@@ -349,6 +462,61 @@ class WaitGroup(
         }
         insertedLength.await()
         return true
+    }
+
+    override suspend fun findIgnoredOrder(orderCode: String): IgnoredOrderSnapshot? {
+        val normalized = orderCode.trim()
+        if (normalized.isEmpty()) return null
+        val result = CompletableDeferred<IgnoredOrderSnapshot?>()
+        if (commands.trySend(Command.ReadIgnoredOrder(normalized, result)).isFailure) return null
+        return result.await()
+    }
+
+    override suspend fun ignoredOrderSnapshots(): List<IgnoredOrderSnapshot> {
+        val result = CompletableDeferred<List<IgnoredOrderSnapshot>>()
+        if (commands.trySend(Command.ReadIgnoredOrders(result)).isFailure) return emptyList()
+        return result.await()
+    }
+
+    override suspend fun insertIgnoredOrder(orderCode: String): Boolean {
+        val normalized = orderCode.trim()
+        if (normalized.isEmpty()) return false
+        val inserted = CompletableDeferred<Boolean>()
+        if (commands.trySend(Command.InsertIgnoredOrder(normalized, inserted)).isFailure) return false
+        return inserted.await()
+    }
+
+    override suspend fun insertIgnoredOrders(orderCodes: List<String>): Int {
+        val normalized = orderCodes.asSequence()
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .distinct()
+            .toList()
+        if (normalized.isEmpty()) return 0
+        val insertedCount = CompletableDeferred<Int>()
+        if (commands.trySend(Command.InsertIgnoredOrders(normalized, insertedCount)).isFailure) {
+            return 0
+        }
+        return insertedCount.await()
+    }
+
+    override suspend fun ignoredOrdersMissingCache(): List<IgnoredCacheNodeRef> {
+        val result = CompletableDeferred<List<IgnoredCacheNodeRef>>()
+        if (commands.trySend(Command.ReadIgnoredMissingCache(result)).isFailure) return emptyList()
+        return result.await()
+    }
+
+    override suspend fun overwriteIgnoredCache(
+        nodeId: String,
+        orderCode: String,
+        cacheNode: BreakfastRightCacheNode
+    ): Boolean {
+        val updated = CompletableDeferred<Boolean>()
+        if (commands.trySend(
+                Command.OverwriteIgnoredCache(nodeId, orderCode, cacheNode, updated)
+            ).isFailure
+        ) return false
+        return updated.await()
     }
 
     override fun len(): Int = length.value
@@ -377,9 +545,108 @@ class WaitGroup(
             try {
                 when (command) {
                     is Command.Push -> {
-                        insertOrCompact(command.request)
+                        command.ignoredSourceNodeId?.let { sourceNodeId ->
+                            unlinkIgnoredSource(sourceNodeId, command.request.orderCode)
+                        }
+                        insertOrCompact(command.request, command.cacheNode)
                         persistIfChanged()
                         command.insertedLength.complete(ringSize())
+                    }
+                    is Command.InsertIgnoredOrder -> {
+                        val duplicate = nodes().any {
+                            it.approvalState == WaitApprovalState.Ignored &&
+                                it.request.orderCode == command.orderCode
+                        }
+                        if (!duplicate) {
+                            insertAfterCurrent(
+                                WaitGroupRequest(
+                                    orderCode = command.orderCode,
+                                    task = WaitGroupTask.QueryBreakfastRight,
+                                    approvalState = WaitApprovalState.Ignored
+                                )
+                            )
+                            persistIfChanged()
+                        }
+                        command.inserted.complete(!duplicate)
+                    }
+                    is Command.InsertIgnoredOrders -> {
+                        val existing = nodes().asSequence()
+                            .filter { it.approvalState == WaitApprovalState.Ignored }
+                            .map { it.request.orderCode }
+                            .toMutableSet()
+                        var insertedCount = 0
+                        command.orderCodes.forEach { orderCode ->
+                            if (existing.add(orderCode)) {
+                                insertAfterCurrent(
+                                    WaitGroupRequest(
+                                        orderCode = orderCode,
+                                        task = WaitGroupTask.QueryBreakfastRight,
+                                        approvalState = WaitApprovalState.Ignored
+                                    )
+                                )
+                                insertedCount += 1
+                            }
+                        }
+                        if (insertedCount > 0) persistIfChanged()
+                        command.insertedCount.complete(insertedCount)
+                    }
+                    is Command.ReadIgnoredMissingCache -> {
+                        removeExpiredIgnoredCaches(System.currentTimeMillis())
+                        persistIfChanged()
+                        command.result.complete(nodes().filter {
+                            it.approvalState == WaitApprovalState.Ignored && it.cacheNode == null
+                        }.map { IgnoredCacheNodeRef(it.id, it.request.orderCode) }
+                        )
+                    }
+                    is Command.ReadIgnoredOrder -> {
+                        val node = nodes().firstOrNull {
+                            it.approvalState == WaitApprovalState.Ignored &&
+                                it.request.orderCode == command.orderCode
+                        }
+                        if (node != null && unlinkExpiredIgnoredCache(
+                                node,
+                                System.currentTimeMillis()
+                            )
+                        ) {
+                            persistIfChanged()
+                            command.result.complete(null)
+                        } else command.result.complete(node?.let {
+                            IgnoredOrderSnapshot(
+                                it.id,
+                                it.request.orderCode,
+                                it.cacheNode,
+                                it.createdAtEpochMs
+                            )
+                        })
+                    }
+                    is Command.ReadIgnoredOrders -> {
+                        removeExpiredIgnoredCaches(System.currentTimeMillis())
+                        persistIfChanged()
+                        command.result.complete(nodes().mapNotNull { node ->
+                            node.takeIf {
+                                it.approvalState == WaitApprovalState.Ignored
+                            }?.let {
+                                IgnoredOrderSnapshot(
+                                    it.id,
+                                    it.request.orderCode,
+                                    it.cacheNode,
+                                    it.createdAtEpochMs
+                                )
+                            }
+                        })
+                    }
+                    is Command.OverwriteIgnoredCache -> {
+                        val node = find(command.nodeId)
+                        val updated = node != null &&
+                            node.approvalState == WaitApprovalState.Ignored &&
+                            node.request.orderCode == command.orderCode &&
+                            command.cacheNode.orderCode == command.orderCode
+                        if (updated) {
+                            // Deliberately overwrite without checking the current value.
+                            node!!.cacheNode = command.cacheNode
+                            writeCacheIndex(command.cacheNode)
+                        }
+                        command.updated.complete(updated)
                     }
                     is Command.Finished -> finish(command)
                     is Command.AgeUnregistered -> {
@@ -416,7 +683,8 @@ class WaitGroup(
                 // Only an answered query awaiting operator action is an
                 // unregistered scan. Enroll/CancelEnrollment are status-change
                 // commands and must never enter an unregistered-scan batch.
-                it.request.task == WaitGroupTask.QueryBreakfastRight &&
+                it.approvalState != WaitApprovalState.Ignored &&
+                    it.request.task == WaitGroupTask.QueryBreakfastRight &&
                     it.awaitingAction &&
                     (forceAging || now - it.createdAtEpochMs >= WAIT_GROUP_UNREGISTERED_MAX_AGE_MS)
             }.take(agingBudget)
@@ -448,7 +716,10 @@ class WaitGroup(
         }
         if (agingBudget > 0) agingBudget = 0
         forceAging = false
-        val pendingNodes = nodes().filter { !it.awaitingAction }
+        // State 3 is a retained inert record: do not submit, age, retry or dequeue it.
+        val pendingNodes = nodes().filter {
+            !it.awaitingAction && it.approvalState != WaitApprovalState.Ignored
+        }
         val node = pendingNodes.firstOrNull { it.nextAttemptAtEpochMs <= now }
         if (node == null) {
             val nextAttemptAt = pendingNodes.minOfOrNull { it.nextAttemptAtEpochMs } ?: return
@@ -510,7 +781,11 @@ class WaitGroup(
             command.nodeIds.mapNotNull(::find).forEach { node ->
                 // Defensive task check: cancellation/status-change nodes must bypass
                 // /upload_unregistered_scan even if a stale command contains their id.
-                if (node.request.task != WaitGroupTask.QueryBreakfastRight || !node.awaitingAction) {
+                if (
+                    node.approvalState == WaitApprovalState.Ignored ||
+                    node.request.task != WaitGroupTask.QueryBreakfastRight ||
+                    !node.awaitingAction
+                ) {
                     Log.w(WAIT_GROUP_TAG, "non-query node bypassed aging upload result task=${node.request.task}")
                     return@forEach
                 }
@@ -534,8 +809,17 @@ class WaitGroup(
         if (processingNodeId != command.nodeId) return
         processingNodeId = null
         val node = find(command.nodeId) ?: return
+        if (node.approvalState == WaitApprovalState.Ignored) {
+            Log.d(
+                WAIT_GROUP_TAG,
+                "state-3 node retained; execution result ignored orderCode=${node.request.orderCode}"
+            )
+            return
+        }
         if (command.approvalProbe && command.result.completed && command.result.success) {
-            val resolvedState = command.result.responseText?.let(::parseApprovalState)
+            val parsedCacheNode = command.result.responseText?.let(::parseBreakfastRightCacheNode)
+            val resolvedState = parsedCacheNode?.allowBreakfast?.toApprovalState()
+                ?: command.result.responseText?.let(::parseApprovalState)
             if (resolvedState == null) {
                 node.nextAttemptAtEpochMs = System.currentTimeMillis() + WAIT_GROUP_RETRY_DELAY_MS
                 revision += 1
@@ -543,6 +827,7 @@ class WaitGroup(
                 return
             }
             node.approvalState = resolvedState
+            if (parsedCacheNode != null) node.cacheNode = parsedCacheNode
             node.approvalResponseText = command.result.responseText
             node.nextAttemptAtEpochMs = 0L
             revision += 1
@@ -563,17 +848,20 @@ class WaitGroup(
                 result = command.result.copy(
                     responseText = command.result.responseText ?: node.approvalResponseText
                 ),
-                createdAtEpochMs = node.createdAtEpochMs
+                createdAtEpochMs = node.createdAtEpochMs,
+                cacheNode = node.cacheNode
             )
             if (
                 completedRequest.task == WaitGroupTask.QueryBreakfastRight &&
                 command.result.success &&
                 !agedOut
             ) {
-                val resolvedState = command.result.responseText
-                    ?.let(::parseApprovalState)
+                val parsedCacheNode = command.result.responseText?.let(::parseBreakfastRightCacheNode)
+                val resolvedState = parsedCacheNode?.allowBreakfast?.toApprovalState()
+                    ?: command.result.responseText?.let(::parseApprovalState)
                     ?: WaitApprovalState.Pending
                 node.approvalState = resolvedState
+                if (parsedCacheNode != null) node.cacheNode = parsedCacheNode
                 node.approvalResponseText = command.result.responseText
                 val pendingStatusTask = node.pendingStatusTask
                 if (pendingStatusTask == null) {
@@ -613,16 +901,24 @@ class WaitGroup(
     }
 
     /** Repeated scans remain valid after completion; only equivalent pending work is compacted. */
-    private fun insertOrCompact(request: WaitGroupRequest) {
-        val matches = nodes().filter { it.request.orderCode == request.orderCode }
+    private fun insertOrCompact(
+        request: WaitGroupRequest,
+        cacheNode: BreakfastRightCacheNode?
+    ) {
+        val matches = nodes().filter {
+            it.request.orderCode == request.orderCode &&
+                it.approvalState != WaitApprovalState.Ignored
+        }
         var resolvedState = request.approvalState
         var approvalResponseText: String? = null
+        var resolvedCacheNode = cacheNode
         if (request.task != WaitGroupTask.QueryBreakfastRight) {
             val inFlightQuery = matches.firstOrNull {
                 it.request.task == WaitGroupTask.QueryBreakfastRight && it.id == processingNodeId
             }
             if (inFlightQuery != null) {
                 inFlightQuery.pendingStatusTask = request.task
+                if (cacheNode != null) inFlightQuery.cacheNode = cacheNode
                 revision += 1
                 Log.i(
                     WAIT_GROUP_TAG,
@@ -637,28 +933,42 @@ class WaitGroup(
                 if (it.awaitingAction) {
                     resolvedState = it.approvalState
                     approvalResponseText = it.approvalResponseText
+                    if (resolvedCacheNode == null) resolvedCacheNode = it.cacheNode
                 }
                 remove(it)
             }
         }
-        val remainingMatches = nodes().filter { it.request.orderCode == request.orderCode }
+        val remainingMatches = nodes().filter {
+            it.request.orderCode == request.orderCode &&
+                it.approvalState != WaitApprovalState.Ignored
+        }
         val cancellation = remainingMatches.firstOrNull {
             it.request.task == WaitGroupTask.CancelEnrollment
         }
         if (cancellation != null) {
+            if (resolvedCacheNode != null) cancellation.cacheNode = resolvedCacheNode
             remainingMatches.filter { it !== cancellation && it.id != processingNodeId }.forEach(::remove)
             return
         }
         if (request.task == WaitGroupTask.CancelEnrollment) {
             remainingMatches.filter { it.id != processingNodeId }.forEach(::remove)
         } else if (remainingMatches.any { it.request.task == request.task }) {
+            if (resolvedCacheNode != null) {
+                remainingMatches.first { it.request.task == request.task }.cacheNode = resolvedCacheNode
+                revision += 1
+            }
             return
         }
-        insertAfterCurrent(request.copy(approvalState = resolvedState), approvalResponseText)
+        insertAfterCurrent(
+            request.copy(approvalState = resolvedState),
+            resolvedCacheNode,
+            approvalResponseText
+        )
     }
 
     private fun insertAfterCurrent(
         request: WaitGroupRequest,
+        cacheNode: BreakfastRightCacheNode? = null,
         approvalResponseText: String? = null
     ) {
         val node = Node(
@@ -666,6 +976,7 @@ class WaitGroup(
             request,
             System.currentTimeMillis(),
             request.approvalState,
+            cacheNode,
             approvalResponseText
         )
         val cursor = current
@@ -683,7 +994,39 @@ class WaitGroup(
 
     private fun find(id: String): Node? = nodes().firstOrNull { it.id == id }
 
+    @Suppress("UNUSED_PARAMETER")
+    private fun unlinkIgnoredSource(nodeId: String, orderCode: String): Boolean {
+        // 空实现位置：状态 3 命中后即使审核结果以状态 1 入队，也不摘除来源节点。
+        return false
+    }
+
+    private fun removeExpiredIgnoredCaches(nowEpochMs: Long) {
+        nodes().filter { isExpiredIgnoredCache(it, nowEpochMs) }.forEach(::unlink)
+    }
+
+    private fun unlinkExpiredIgnoredCache(target: Node, nowEpochMs: Long): Boolean {
+        if (!isExpiredIgnoredCache(target, nowEpochMs)) return false
+        return unlink(target)
+    }
+
+    private fun isExpiredIgnoredCache(target: Node, nowEpochMs: Long): Boolean {
+        if (target.approvalState != WaitApprovalState.Ignored) return false
+        val cachedAt = target.cacheNode?.cachedAtEpochMs ?: return false
+        return isIgnoredCacheExpired(cachedAt, nowEpochMs)
+    }
+
     private fun remove(target: Node): Boolean {
+        if (target.approvalState == WaitApprovalState.Ignored) {
+            Log.d(
+                WAIT_GROUP_TAG,
+                "state-3 node retained; dequeue ignored orderCode=${target.request.orderCode}"
+            )
+            return false
+        }
+        return unlink(target)
+    }
+
+    private fun unlink(target: Node): Boolean {
         val cursor = current ?: return false
         if (size == 1 && cursor === target) {
             current = null
@@ -705,6 +1048,9 @@ class WaitGroup(
         }
         revision += 1
         length.value = size
+        if (target.approvalState == WaitApprovalState.Ignored) {
+            removeCacheIndex(target.request.orderCode)
+        }
         return true
     }
 
@@ -734,7 +1080,7 @@ class WaitGroup(
             })
         }
         return JSONObject().apply {
-            put("schema", 6)
+            put("schema", 9)
             put("revision", revision)
             put("nodes", records)
         }.toString()
@@ -764,7 +1110,8 @@ class WaitGroup(
         runCatching {
             val root = JSONObject(raw)
             val schema = root.optInt("schema")
-            require(schema in 1..6)
+            require(schema in 1..9)
+            val migratedCacheTimestamp = System.currentTimeMillis()
             revision = root.optLong("revision")
             val records = root.getJSONArray("nodes")
             var last: Node? = null
@@ -775,7 +1122,15 @@ class WaitGroup(
                 } else {
                     WaitGroupTask.QueryBreakfastRight
                 }
-                if (task == WaitGroupTask.QueryBreakfastRight) {
+                val approvalState = if (schema >= 4) {
+                    WaitApprovalState.from(item.getInt("approval_state"))
+                } else {
+                    WaitApprovalState.Pending
+                }
+                if (
+                    task == WaitGroupTask.QueryBreakfastRight &&
+                    approvalState != WaitApprovalState.Ignored
+                ) {
                     Log.w(
                         WAIT_GROUP_TAG,
                         "discarding legacy query node; queue ingress now requires an approval action"
@@ -786,11 +1141,13 @@ class WaitGroup(
                     id = item.getString("id"),
                     request = WaitGroupRequest(item.getString("order_code"), task),
                     createdAtEpochMs = item.getLong("created_at"),
-                    approvalState = if (schema >= 4) {
-                        WaitApprovalState.from(item.getInt("approval_state"))
-                    } else {
-                        WaitApprovalState.Pending
-                    },
+                    approvalState = approvalState,
+                    cacheNode = readCacheIndex(item.getString("order_code"))
+                        ?: if (schema in 7..8 && !item.isNull("cache_node")) {
+                            item.getJSONObject("cache_node").toBreakfastRightCacheNode(
+                                fallbackCachedAtEpochMs = migratedCacheTimestamp
+                            )?.also(::writeCacheIndex)
+                        } else null,
                     approvalResponseText = if (schema >= 5 && !item.isNull("approval_response")) {
                         item.optString("approval_response").takeIf(String::isNotBlank)
                     } else {
@@ -808,7 +1165,8 @@ class WaitGroup(
                 size += 1
             }
             if (current != null) last?.next = current
-            lastSnapshotHash = if (schema == 6) raw.sha256() else ""
+            lastSnapshotHash = if (schema == 9) raw.sha256() else ""
+            if (schema in 7..8) persistIfChanged(force = true)
         }.onFailure {
             current = null
             size = 0
@@ -816,7 +1174,97 @@ class WaitGroup(
             Log.e(WAIT_GROUP_TAG, "discarding invalid persisted ring", it)
         }
     }
+
+    private fun readCacheIndex(orderCode: String): BreakfastRightCacheNode? =
+        cacheIndexPreferences.getString(orderCode, null)?.let { raw ->
+            runCatching {
+                JSONObject(raw).toBreakfastRightCacheNode(System.currentTimeMillis())
+            }.getOrNull()?.takeIf { it.orderCode == orderCode }
+        }
+
+    private fun writeCacheIndex(cacheNode: BreakfastRightCacheNode) {
+        cacheIndexPreferences.edit()
+            .putString(cacheNode.orderCode, cacheNode.toJson().toString())
+            .commit()
+    }
+
+    private fun removeCacheIndex(orderCode: String) {
+        cacheIndexPreferences.edit().remove(orderCode).commit()
+    }
 }
+
+internal fun parseBreakfastRightCacheNode(responseText: String): BreakfastRightCacheNode? =
+    runCatching {
+        val root = JSONObject(responseText)
+        val payload = root.optJSONObject("data") ?: root
+        payload.toBreakfastRightCacheNode(fallbackCachedAtEpochMs = System.currentTimeMillis())
+    }.getOrNull()
+
+private fun JSONObject.toBreakfastRightCacheNode(
+    fallbackCachedAtEpochMs: Long
+): BreakfastRightCacheNode? {
+    val orderCode = optNullableString("order_code") ?: return null
+    val cachedAtEpochMs = optLong("cached_at", fallbackCachedAtEpochMs)
+        .takeIf { it > 0L } ?: fallbackCachedAtEpochMs
+    return BreakfastRightCacheNode(
+        orderCode = orderCode,
+        cachedAtEpochMs = cachedAtEpochMs,
+        cardNo = optNullableString("card_no"),
+        nameB64 = optNullableString("name_b64"),
+        sexB64 = optNullableString("sex_b64"),
+        phone = optNullableString("phone"),
+        avatarUrl = optNullableString("avatar_url"),
+        birthDate = optNullableString("birth_date"),
+        packageNameB64 = optNullableString("package_name_b64"),
+        examTypeB64 = optNullableString("exam_type_b64"),
+        organizationNameB64 = optNullableString("organization_name_b64"),
+        examTotalPriceB64 = optNullableString("exam_total_price_b64"),
+        hasBreakfast = optNullableBoolean("has_breakfast"),
+        allowBreakfast = optNullableBoolean("allow_breakfast"),
+        breakfastStatus = optNullableInt("breakfast_status"),
+        reasonB64 = optNullableString("reason_b64")
+    )
+}
+
+private fun BreakfastRightCacheNode.toJson(): JSONObject = JSONObject().apply {
+    put("order_code", orderCode)
+    put("cached_at", cachedAtEpochMs)
+    putNullable("card_no", cardNo)
+    putNullable("name_b64", nameB64)
+    putNullable("sex_b64", sexB64)
+    putNullable("phone", phone)
+    putNullable("avatar_url", avatarUrl)
+    putNullable("birth_date", birthDate)
+    putNullable("package_name_b64", packageNameB64)
+    putNullable("exam_type_b64", examTypeB64)
+    putNullable("organization_name_b64", organizationNameB64)
+    putNullable("exam_total_price_b64", examTotalPriceB64)
+    putNullable("has_breakfast", hasBreakfast)
+    putNullable("allow_breakfast", allowBreakfast)
+    putNullable("breakfast_status", breakfastStatus)
+    putNullable("reason_b64", reasonB64)
+}
+
+internal fun isIgnoredCacheExpired(cachedAtEpochMs: Long, nowEpochMs: Long): Boolean =
+    cachedAtEpochMs > 0L &&
+        nowEpochMs >= cachedAtEpochMs &&
+        nowEpochMs - cachedAtEpochMs > IGNORED_CACHE_MAX_AGE_MS
+
+private fun JSONObject.putNullable(name: String, value: Any?) {
+    put(name, value ?: JSONObject.NULL)
+}
+
+private fun JSONObject.optNullableString(name: String): String? =
+    if (!has(name) || isNull(name)) null else optString(name).takeIf(String::isNotBlank)
+
+private fun JSONObject.optNullableBoolean(name: String): Boolean? =
+    if (!has(name) || isNull(name) || opt(name) !is Boolean) null else getBoolean(name)
+
+private fun JSONObject.optNullableInt(name: String): Int? =
+    if (!has(name) || isNull(name)) null else (opt(name) as? Number)?.toInt()
+
+private fun Boolean.toApprovalState(): WaitApprovalState =
+    if (this) WaitApprovalState.Approved else WaitApprovalState.Blocked
 
 private fun parseApprovalState(responseText: String): WaitApprovalState? {
     val allowBreakfast = runCatching {
