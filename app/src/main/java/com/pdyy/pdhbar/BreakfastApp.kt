@@ -674,7 +674,7 @@ fun BreakfastApp() {
                     address = IPv4Address(settings.host),
                     route = NetRoute(scheme = settings.scheme, port = settings.port)
                 )
-                runtime.api.onupdate(systemPipe)
+                runtime.updateBackendTarget(systemPipe)
                 runtime.waitgroup.ageUnregistered(force = true)
                 insightPanelAddress = settings.insightPanelAddress
                 insightFirstRoute = settings.insightFirstRoute
@@ -1506,6 +1506,13 @@ private fun CustomerDialog(
                     avatarUrl = customer.avatarUrl,
                     querying = customer.querying
                 )
+                if (customer.preCached) {
+                    Text(
+                        text = "预缓存记录",
+                        color = FlashlightGreen,
+                        fontSize = 12.sp
+                    )
+                }
                 Text("订单号：${customer.orderCode}")
                 Text("姓名：${customer.name}")
                 Text("套餐：${customer.packageName ?: "-"}")
@@ -1546,7 +1553,11 @@ private fun CustomerDialog(
         },
         confirmButton = {
             Button(
-                enabled = !customer.querying || backgroundApprovalAvailable,
+                enabled = if (customer.querying) {
+                    backgroundApprovalAvailable
+                } else {
+                    customer.allowBreakfast
+                },
                 onClick = onDone,
                 colors = DialogButtonColors
             ) {
@@ -1555,11 +1566,13 @@ private fun CustomerDialog(
         },
         dismissButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(
-                    enabled = true,
-                    onClick = onCancelBreakfast,
-                    colors = DialogTextButtonColors
-                ) { Text("取消登记") }
+                if (customer.querying || customer.allowBreakfast) {
+                    TextButton(
+                        enabled = true,
+                        onClick = onCancelBreakfast,
+                        colors = DialogTextButtonColors
+                    ) { Text("取消登记") }
+                }
                 TextButton(onClick = onDismiss, colors = DialogTextButtonColors) { Text("关闭") }
             }
         }
