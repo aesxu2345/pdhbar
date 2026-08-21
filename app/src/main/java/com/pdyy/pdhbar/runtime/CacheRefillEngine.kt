@@ -70,6 +70,23 @@ interface CacheRefillEngine {
     fun stop()
 }
 
+internal data class CacheRefillWorkToken(val cacheIndex: Long, val generation: Long)
+
+internal data class CacheRefillWorkIdentity(
+    val cacheIndex: Long,
+    val generation: Long,
+    val leaseId: Long
+)
+
+internal fun cacheRefillIdentityMatches(
+    expected: CacheRefillWorkIdentity,
+    cacheIndex: Long,
+    generation: Long,
+    leaseId: Long
+): Boolean = expected.cacheIndex == cacheIndex &&
+    expected.generation == generation &&
+    expected.leaseId == leaseId
+
 object CacheRefillEngineFactory {
     fun create(
         kind: CacheRefillEngineKind,
@@ -105,19 +122,28 @@ private class IndexedBoundedCacheRefillEngine(
     private val query: suspend (String) -> WaitGroupExecutionResult,
     private val onObserved: (IgnoredPoolObservation) -> Unit
 ) : CacheRefillEngine {
-    private enum class KeyPhase { Queued, Running }
+    private enum class KeyPhase { Queued, Running, Committing }
     private data class KeyState(
         val cacheIndex: Long,
         val nodeId: String,
         val orderCode: String,
+        val generation: Long,
+        var leaseId: Long,
         var phase: KeyPhase
+    )
+    private data class WorkLease(
+        val identity: CacheRefillWorkIdentity,
+        val nodeId: String,
+        val orderCode: String
     )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val signals = Channel<Unit>(Channel.CONFLATED)
-    private val tasks = Channel<Long>(profile.bufferSize)
+    private val tasks = Channel<CacheRefillWorkToken>(profile.bufferSize)
     private val stateLock = ReentrantLock()
     private val states = TreeMap<Long, KeyState>()
+    private var nextGeneration = 1L
+    private var nextLeaseId = 1L
     private var coordinator: Job? = null
     private val workers = ArrayList<Job>(profile.workerCount)
 
@@ -174,25 +200,34 @@ private class IndexedBoundedCacheRefillEngine(
             .filter { it.cacheNode == null && it.cacheIndex > 0L }
             .toList()
         val liveIndexes = snapshots.asSequence().map { it.cacheIndex }.filter { it > 0L }.toSet()
-        val accepted = ArrayList<Long>()
+        val accepted = ArrayList<CacheRefillWorkToken>()
         stateLock.withLock {
-            states.keys.removeAll { it !in liveIndexes }
+            states.entries.removeAll { (cacheIndex, state) ->
+                cacheIndex !in liveIndexes && state.phase == KeyPhase.Queued
+            }
             candidates.forEach { node ->
                 if (states.size >= profile.bufferSize || states.containsKey(node.cacheIndex)) {
                     return@forEach
                 }
+                val generation = nextGeneration++
                 states[node.cacheIndex] = KeyState(
                     cacheIndex = node.cacheIndex,
                     nodeId = node.nodeId,
                     orderCode = node.orderCode,
+                    generation = generation,
+                    leaseId = 0L,
                     phase = KeyPhase.Queued
                 )
-                accepted += node.cacheIndex
+                accepted += CacheRefillWorkToken(node.cacheIndex, generation)
             }
         }
-        accepted.forEach { cacheIndex ->
-            if (tasks.trySend(cacheIndex).isFailure) {
-                stateLock.withLock { states.remove(cacheIndex) }
+        accepted.forEach { token ->
+            if (tasks.trySend(token).isFailure) {
+                stateLock.withLock {
+                    states[token.cacheIndex]?.takeIf {
+                        it.generation == token.generation && it.phase == KeyPhase.Queued
+                    }?.let { states.remove(token.cacheIndex) }
+                }
             }
         }
         Log.i(
@@ -203,11 +238,24 @@ private class IndexedBoundedCacheRefillEngine(
     }
 
     private suspend fun workerLoop(workerId: Int) {
-        for (cacheIndex in tasks) {
+        for (token in tasks) {
             val work = stateLock.withLock {
-                states[cacheIndex]?.takeIf { it.phase == KeyPhase.Queued }?.also {
+                states[token.cacheIndex]?.takeIf {
+                    it.generation == token.generation && it.phase == KeyPhase.Queued
+                }?.also {
+                    it.leaseId = nextLeaseId++
                     it.phase = KeyPhase.Running
-                }?.copy()
+                }?.let {
+                    WorkLease(
+                        identity = CacheRefillWorkIdentity(
+                            it.cacheIndex,
+                            it.generation,
+                            it.leaseId
+                        ),
+                        nodeId = it.nodeId,
+                        orderCode = it.orderCode
+                    )
+                }
             } ?: continue
             try {
                 val result = query(work.orderCode)
@@ -215,32 +263,57 @@ private class IndexedBoundedCacheRefillEngine(
                     result.responseText?.let(::parseBreakfastRightCacheNode)
                 } else null
                 if (parsed != null && parsed.orderCode == work.orderCode) {
-                    val indexedCache = parsed.copy(cacheIndex = work.cacheIndex)
-                    val updated = waitGroup.overwriteIgnoredCache(
-                        nodeId = work.nodeId,
-                        orderCode = work.orderCode,
-                        cacheNode = indexedCache
-                    )
-                    Log.i(
-                        CACHE_REFILL_TAG,
-                        "worker=$workerId index=${work.cacheIndex} orderCode=${work.orderCode} updated=$updated"
-                    )
+                    val mayCommit = stateLock.withLock {
+                        states[work.identity.cacheIndex]?.takeIf {
+                            cacheRefillIdentityMatches(
+                                work.identity,
+                                it.cacheIndex,
+                                it.generation,
+                                it.leaseId
+                            ) && it.phase == KeyPhase.Running
+                        }?.also { it.phase = KeyPhase.Committing } != null
+                    }
+                    if (mayCommit) {
+                        val indexedCache = parsed.copy(cacheIndex = work.identity.cacheIndex)
+                        val updated = waitGroup.overwriteIgnoredCache(
+                            nodeId = work.nodeId,
+                            orderCode = work.orderCode,
+                            cacheNode = indexedCache
+                        )
+                        Log.i(
+                            CACHE_REFILL_TAG,
+                            "worker=$workerId index=${work.identity.cacheIndex} " +
+                                "generation=${work.identity.generation} orderCode=${work.orderCode} " +
+                                "updated=$updated"
+                        )
+                    } else {
+                        Log.i(
+                            CACHE_REFILL_TAG,
+                            "worker=$workerId discarded stale refill index=" +
+                                "${work.identity.cacheIndex} generation=${work.identity.generation}"
+                        )
+                    }
                 } else {
                     Log.w(
                         CACHE_REFILL_TAG,
-                        "worker=$workerId rejected index=${work.cacheIndex} " +
+                        "worker=$workerId rejected index=${work.identity.cacheIndex} " +
                             "orderCode=${work.orderCode} message=${result.message}"
                     )
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Throwable) {
-                Log.w(CACHE_REFILL_TAG, "worker=$workerId failed index=$cacheIndex", error)
+                Log.w(CACHE_REFILL_TAG, "worker=$workerId failed index=${token.cacheIndex}", error)
             } finally {
                 stateLock.withLock {
-                    states[cacheIndex]?.takeIf {
-                        it.nodeId == work.nodeId && it.orderCode == work.orderCode
-                    }?.let { states.remove(cacheIndex) }
+                    states[work.identity.cacheIndex]?.takeIf {
+                        cacheRefillIdentityMatches(
+                            work.identity,
+                            it.cacheIndex,
+                            it.generation,
+                            it.leaseId
+                        ) && it.phase != KeyPhase.Queued
+                    }?.let { states.remove(work.identity.cacheIndex) }
                 }
             }
             delay(CACHE_REFILL_REQUEST_GAP_MS)
