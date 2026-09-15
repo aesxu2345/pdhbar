@@ -8,6 +8,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -16,12 +17,12 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 private const val WAIT_GROUP_PREFS = "breakfast_wait_group"
 private const val WAIT_GROUP_SNAPSHOT = "ring_snapshot"
@@ -180,10 +181,9 @@ class WaitGroupBuffer(
     override val onwaitgroup: SharedFlow<WaitGroupOutput> = outputs
     override val lenUpdates: StateFlow<Int> = length.asStateFlow()
 
-    /** 空方法声明；真实 WaitGroup 仅在 push/len/enroll/persist 执行时替换进来。 */
-    private val emptyWaitGroupDeclaration: () -> WaitGroup? = { null }
+    /** Null until construction/restore finishes; scan reads must never resolve this delegate. */
     @Volatile
-    private var waitGroupDeclaration: () -> WaitGroup? = emptyWaitGroupDeclaration
+    private var delegate: WaitGroup? = null
     private var attachedTarget: WaitGroup? = null
     private var outputForwarder: Job? = null
     private var lengthForwarder: Job? = null
@@ -235,8 +235,12 @@ class WaitGroupBuffer(
     override suspend fun insertIgnoredOrders(orderCodes: List<String>): Int =
         resolveWaitGroup().insertIgnoredOrders(orderCodes)
 
-    override suspend fun findIgnoredOrder(orderCode: String): IgnoredOrderSnapshot? =
-        resolveWaitGroup().findIgnoredOrder(orderCode)
+    override suspend fun findIgnoredOrder(orderCode: String): IgnoredOrderSnapshot? {
+        val active = delegate ?: return null
+        val snapshot = active.findIgnoredOrder(orderCode)
+        // Reject a replacement observed at this read's final delegate identity check.
+        return snapshot.takeIf { delegate === active }
+    }
 
     override suspend fun ignoredOrderSnapshots(): List<IgnoredOrderSnapshot> =
         resolveWaitGroup().ignoredOrderSnapshots()
@@ -274,10 +278,10 @@ class WaitGroupBuffer(
     )
 
     private fun resolveWaitGroup(): WaitGroup {
-        waitGroupDeclaration()?.let { return it }
+        delegate?.let { return it }
         return synchronized(declarationLock) {
-            waitGroupDeclaration() ?: createWaitGroup().also { replacement ->
-                waitGroupDeclaration = { replacement }
+            delegate ?: createWaitGroup().also { replacement ->
+                delegate = replacement
                 attach(replacement)
             }
         }
@@ -285,10 +289,10 @@ class WaitGroupBuffer(
 
     private fun replaceFailedWaitGroup(failed: WaitGroup): WaitGroup {
         return synchronized(declarationLock) {
-            val current = waitGroupDeclaration()
+            val current = delegate
             if (current === failed) {
+                delegate = null
                 destroy(failed)
-                waitGroupDeclaration = emptyWaitGroupDeclaration
                 Log.i(WAIT_GROUP_TAG, "failed wait group destroyed; declaration reset")
             }
             resolveWaitGroup().also(WaitGroup::enroll)
@@ -312,15 +316,21 @@ class WaitGroupBuffer(
         fallback: T,
         action: (WaitGroup) -> T
     ): T {
-        val active = resolveWaitGroup()
         return try {
-            action(active)
-        } catch (error: Throwable) {
-            Log.e(WAIT_GROUP_TAG, "$operation failed; replacing wait group", error)
-            val replacement = replaceFailedWaitGroup(active)
-            runCatching { action(replacement) }
-                .onFailure { Log.e(WAIT_GROUP_TAG, "replacement $operation failed", it) }
-                .getOrDefault(fallback)
+            val active = resolveWaitGroup()
+            try {
+                action(active)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.e(WAIT_GROUP_TAG, "$operation failed; replacing wait group", error)
+                action(replaceFailedWaitGroup(active))
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Log.e(WAIT_GROUP_TAG, "$operation initialization/recovery failed", error)
+            fallback
         }
     }
 
@@ -329,24 +339,24 @@ class WaitGroupBuffer(
         length.value = target.len()
         outputForwarder = scope.launch {
             target.onwaitgroup.collect { output ->
-                if (waitGroupDeclaration() === target) outputs.emit(output)
+                if (delegate === target) outputs.emit(output)
             }
         }
         lengthForwarder = scope.launch {
             target.lenUpdates.collect { value ->
-                if (waitGroupDeclaration() === target) length.value = value
+                if (delegate === target) length.value = value
             }
         }
         scope.launch {
-            while (waitGroupDeclaration() === target) {
+            while (delegate === target) {
                 delay(WAIT_GROUP_AGING_TICK_MS)
-                if (waitGroupDeclaration() === target) target.ageUnregistered()
+                if (delegate === target) target.ageUnregistered()
             }
         }
     }
 }
 
-/** Persistent round-robin queue. Mutations are actor-serialized and intentionally lock-free. */
+/** Persistent round-robin queue. Only restore/the actor own Nodes; scan reads use published values. */
 class WaitGroup(
     context: Context,
     private val executor: suspend (WaitGroupRequest) -> WaitGroupExecutionResult,
@@ -384,10 +394,6 @@ class WaitGroup(
         data class ReadIgnoredMissingCache(
             val result: CompletableDeferred<List<IgnoredCacheNodeRef>>
         ) : Command
-        data class ReadIgnoredOrder(
-            val orderCode: String,
-            val result: CompletableDeferred<IgnoredOrderSnapshot?>
-        ) : Command
         data class ReadIgnoredOrders(
             val result: CompletableDeferred<List<IgnoredOrderSnapshot>>
         ) : Command
@@ -419,6 +425,9 @@ class WaitGroup(
         .getSharedPreferences(WAIT_GROUP_CACHE_INDEX_PREFS, Context.MODE_PRIVATE)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val commands = Channel<Command>(Channel.UNLIMITED)
+    private val pendingReplies = ConcurrentHashMap.newKeySet<CompletableDeferred<*>>()
+    private val ignoredReadIndex = IgnoredOrderReadIndex()
+    @Volatile private var stopped = false
     private val outputs = MutableSharedFlow<WaitGroupOutput>(extraBufferCapacity = 64)
     private val length = MutableStateFlow(0)
     override val onwaitgroup: SharedFlow<WaitGroupOutput> = outputs
@@ -452,7 +461,7 @@ class WaitGroup(
         val normalized = orderCode.trim()
         if (normalized.isEmpty()) return false
         val insertedLength = CompletableDeferred<Int>()
-        val result = commands.trySend(
+        val accepted = submit(
             Command.Push(
                 WaitGroupRequest(normalized, action.toTask(), approvalState),
                 cacheNode?.takeIf { it.orderCode == normalized },
@@ -460,7 +469,7 @@ class WaitGroup(
                 insertedLength
             )
         )
-        if (result.isFailure) {
+        if (!accepted) {
             Log.e(WAIT_GROUP_TAG, "push rejected because wait group is closed: orderCode=$normalized")
             return false
         }
@@ -471,14 +480,12 @@ class WaitGroup(
     override suspend fun findIgnoredOrder(orderCode: String): IgnoredOrderSnapshot? {
         val normalized = orderCode.trim()
         if (normalized.isEmpty()) return null
-        val result = CompletableDeferred<IgnoredOrderSnapshot?>()
-        if (commands.trySend(Command.ReadIgnoredOrder(normalized, result)).isFailure) return null
-        return result.await()
+        return ignoredReadIndex.get(normalized)
     }
 
     override suspend fun ignoredOrderSnapshots(): List<IgnoredOrderSnapshot> {
         val result = CompletableDeferred<List<IgnoredOrderSnapshot>>()
-        if (commands.trySend(Command.ReadIgnoredOrders(result)).isFailure) return emptyList()
+        if (!submit(Command.ReadIgnoredOrders(result))) return emptyList()
         return result.await()
     }
 
@@ -486,7 +493,7 @@ class WaitGroup(
         val normalized = orderCode.trim()
         if (normalized.isEmpty()) return false
         val inserted = CompletableDeferred<Boolean>()
-        if (commands.trySend(Command.InsertIgnoredOrder(normalized, inserted)).isFailure) return false
+        if (!submit(Command.InsertIgnoredOrder(normalized, inserted))) return false
         return inserted.await()
     }
 
@@ -498,7 +505,7 @@ class WaitGroup(
             .toList()
         if (normalized.isEmpty()) return 0
         val insertedCount = CompletableDeferred<Int>()
-        if (commands.trySend(Command.InsertIgnoredOrders(normalized, insertedCount)).isFailure) {
+        if (!submit(Command.InsertIgnoredOrders(normalized, insertedCount))) {
             return 0
         }
         return insertedCount.await()
@@ -506,7 +513,7 @@ class WaitGroup(
 
     override suspend fun ignoredOrdersMissingCache(): List<IgnoredCacheNodeRef> {
         val result = CompletableDeferred<List<IgnoredCacheNodeRef>>()
-        if (commands.trySend(Command.ReadIgnoredMissingCache(result)).isFailure) return emptyList()
+        if (!submit(Command.ReadIgnoredMissingCache(result))) return emptyList()
         return result.await()
     }
 
@@ -516,9 +523,9 @@ class WaitGroup(
         cacheNode: BreakfastRightCacheNode
     ): Boolean {
         val updated = CompletableDeferred<Boolean>()
-        if (commands.trySend(
+        if (!submit(
                 Command.OverwriteIgnoredCache(nodeId, orderCode, cacheNode, updated)
-            ).isFailure
+            )
         ) return false
         return updated.await()
     }
@@ -539,146 +546,173 @@ class WaitGroup(
     }
 
     internal fun shutdown() {
-        commands.trySend(Command.Persist)
+        // Withdraw reads and fail even the in-flight reply before waiting for any disk operation.
+        stopped = true
+        ignoredReadIndex.close()
         commands.trySend(Command.Stop)
+        closeAndFailPending(IllegalStateException("wait group stopped"))
+    }
+
+    private fun Command.reply(): CompletableDeferred<*>? = when (this) {
+        is Command.Push -> insertedLength
+        is Command.InsertIgnoredOrder -> inserted
+        is Command.InsertIgnoredOrders -> insertedCount
+        is Command.ReadIgnoredMissingCache -> result
+        is Command.ReadIgnoredOrders -> result
+        is Command.OverwriteIgnoredCache -> updated
+        else -> null
+    }
+
+    private fun submit(command: Command): Boolean {
+        val reply = checkNotNull(command.reply())
+        pendingReplies.add(reply)
+        reply.invokeOnCompletion { pendingReplies.remove(reply) }
+        if (stopped || commands.trySend(command).isFailure) {
+            reply.completeExceptionally(IllegalStateException("wait group stopped"))
+            return false
+        }
+        return true
+    }
+
+    private fun closeAndFailPending(error: Throwable) {
+        stopped = true
+        ignoredReadIndex.close()
+        commands.close()
+        pendingReplies.forEach { it.completeExceptionally(error) }
     }
 
     private suspend fun actorLoop() {
-        while (scope.isActive) {
-            val command = commands.receive()
-            try {
-                when (command) {
-                    is Command.Push -> {
-                        command.ignoredSourceNodeId?.let { sourceNodeId ->
-                            unlinkIgnoredSource(sourceNodeId, command.request.orderCode)
-                        }
-                        insertOrCompact(command.request, command.cacheNode)
-                        persistIfChanged()
-                        command.insertedLength.complete(ringSize())
-                    }
-                    is Command.InsertIgnoredOrder -> {
-                        val duplicate = nodes().any {
-                            it.approvalState == WaitApprovalState.Ignored &&
-                                it.request.orderCode == command.orderCode
-                        }
-                        if (!duplicate) {
-                            insertAfterCurrent(
-                                WaitGroupRequest(
-                                    orderCode = command.orderCode,
-                                    task = WaitGroupTask.QueryBreakfastRight,
-                                    approvalState = WaitApprovalState.Ignored
-                                )
-                            )
+        var stopCause: Throwable = IllegalStateException("wait group stopped")
+        try {
+            for (command in commands) {
+                if (stopped && command != Command.Stop) {
+                    command.reply()?.completeExceptionally(stopCause)
+                    continue
+                }
+                try {
+                    when (command) {
+                        is Command.Push -> {
+                            removeExpiredIgnoredCaches(System.currentTimeMillis())
+                            command.ignoredSourceNodeId?.let { sourceNodeId ->
+                                unlinkIgnoredSource(sourceNodeId, command.request.orderCode)
+                            }
+                            insertOrCompact(command.request, command.cacheNode)
                             persistIfChanged()
+                            command.insertedLength.complete(ringSize())
                         }
-                        command.inserted.complete(!duplicate)
-                    }
-                    is Command.InsertIgnoredOrders -> {
-                        val existing = nodes().asSequence()
-                            .filter { it.approvalState == WaitApprovalState.Ignored }
-                            .map { it.request.orderCode }
-                            .toMutableSet()
-                        var insertedCount = 0
-                        command.orderCodes.forEach { orderCode ->
-                            if (existing.add(orderCode)) {
+                        is Command.InsertIgnoredOrder -> {
+                            removeExpiredIgnoredCaches(System.currentTimeMillis())
+                            val duplicate = nodes().any {
+                                it.approvalState == WaitApprovalState.Ignored &&
+                                    it.request.orderCode == command.orderCode
+                            }
+                            if (!duplicate) {
                                 insertAfterCurrent(
                                     WaitGroupRequest(
-                                        orderCode = orderCode,
+                                        orderCode = command.orderCode,
                                         task = WaitGroupTask.QueryBreakfastRight,
                                         approvalState = WaitApprovalState.Ignored
                                     )
                                 )
-                                insertedCount += 1
                             }
-                        }
-                        if (insertedCount > 0) persistIfChanged()
-                        command.insertedCount.complete(insertedCount)
-                    }
-                    is Command.ReadIgnoredMissingCache -> {
-                        removeExpiredIgnoredCaches(System.currentTimeMillis())
-                        persistIfChanged()
-                        command.result.complete(nodes().filter {
-                            it.approvalState == WaitApprovalState.Ignored && it.cacheNode == null
-                        }.map { IgnoredCacheNodeRef(it.id, it.request.orderCode) }
-                        )
-                    }
-                    is Command.ReadIgnoredOrder -> {
-                        val node = nodes().firstOrNull {
-                            it.approvalState == WaitApprovalState.Ignored &&
-                                it.request.orderCode == command.orderCode
-                        }
-                        if (node != null && unlinkExpiredIgnoredCache(
-                                node,
-                                System.currentTimeMillis()
-                            )
-                        ) {
+                            // Pruning changes the ring even when every insertion is a duplicate.
                             persistIfChanged()
-                            command.result.complete(null)
-                        } else command.result.complete(node?.let {
-                            IgnoredOrderSnapshot(
-                                it.id,
-                                it.request.orderCode,
-                                it.cacheNode,
-                                it.createdAtEpochMs,
-                                it.cacheIndex
-                            )
-                        })
-                    }
-                    is Command.ReadIgnoredOrders -> {
-                        removeExpiredIgnoredCaches(System.currentTimeMillis())
-                        persistIfChanged()
-                        command.result.complete(nodes().mapNotNull { node ->
-                            node.takeIf {
-                                it.approvalState == WaitApprovalState.Ignored
-                            }?.let {
-                                IgnoredOrderSnapshot(
-                                    it.id,
-                                    it.request.orderCode,
-                                    it.cacheNode,
-                                    it.createdAtEpochMs,
-                                    it.cacheIndex
-                                )
-                            }
-                        })
-                    }
-                    is Command.OverwriteIgnoredCache -> {
-                        val node = find(command.nodeId)
-                        val updated = node != null &&
-                            node.approvalState == WaitApprovalState.Ignored &&
-                            node.request.orderCode == command.orderCode &&
-                            command.cacheNode.orderCode == command.orderCode
-                        if (updated) {
-                            // Deliberately overwrite without checking the current value.
-                            val indexedCache = command.cacheNode.copy(cacheIndex = node!!.cacheIndex)
-                            node.cacheNode = indexedCache
-                            writeCacheIndex(indexedCache)
+                            command.inserted.complete(!duplicate)
                         }
-                        command.updated.complete(updated)
+                        is Command.InsertIgnoredOrders -> {
+                            removeExpiredIgnoredCaches(System.currentTimeMillis())
+                            val existing = nodes().asSequence()
+                                .filter { it.approvalState == WaitApprovalState.Ignored }
+                                .map { it.request.orderCode }
+                                .toMutableSet()
+                            var insertedCount = 0
+                            command.orderCodes.forEach { orderCode ->
+                                if (existing.add(orderCode)) {
+                                    insertAfterCurrent(
+                                        WaitGroupRequest(
+                                            orderCode = orderCode,
+                                            task = WaitGroupTask.QueryBreakfastRight,
+                                            approvalState = WaitApprovalState.Ignored
+                                        )
+                                    )
+                                    insertedCount += 1
+                                }
+                            }
+                            persistIfChanged()
+                            command.insertedCount.complete(insertedCount)
+                        }
+                        is Command.ReadIgnoredMissingCache -> {
+                            removeExpiredIgnoredCaches(System.currentTimeMillis())
+                            persistIfChanged()
+                            command.result.complete(nodes().filter {
+                                it.approvalState == WaitApprovalState.Ignored && it.cacheNode == null
+                            }.map { IgnoredCacheNodeRef(it.id, it.request.orderCode) })
+                        }
+                        is Command.ReadIgnoredOrders -> {
+                            removeExpiredIgnoredCaches(System.currentTimeMillis())
+                            persistIfChanged()
+                            command.result.complete(nodes().filter {
+                                it.approvalState == WaitApprovalState.Ignored
+                            }.map { it.ignoredSnapshot() })
+                        }
+                        is Command.OverwriteIgnoredCache -> {
+                            val node = find(command.nodeId)
+                            val now = System.currentTimeMillis()
+                            val expired = node != null && unlinkExpiredIgnoredCache(node, now)
+                            if (expired) persistIfChanged()
+                            val updated = node != null && !expired &&
+                                node.approvalState == WaitApprovalState.Ignored &&
+                                node.request.orderCode == command.orderCode &&
+                                command.cacheNode.orderCode == command.orderCode &&
+                                (command.cacheNode.cacheIndex == 0L ||
+                                    command.cacheNode.cacheIndex == node.cacheIndex) &&
+                                !isIgnoredCacheExpired(command.cacheNode.cachedAtEpochMs, now) &&
+                                ignoredReadIndex.matches(command.orderCode, node.id, node.cacheIndex)
+                            if (updated) {
+                                val indexedCache = command.cacheNode.copy(cacheIndex = node!!.cacheIndex)
+                                node.cacheNode = indexedCache
+                                publishIgnored(node)
+                                writeCacheIndex(indexedCache)
+                            }
+                            command.updated.complete(updated)
+                        }
+                        is Command.Finished -> finish(command)
+                        is Command.AgeUnregistered -> {
+                            removeExpiredIgnoredCaches(System.currentTimeMillis())
+                            persistIfChanged()
+                            agingBudget = WAIT_GROUP_AGING_BATCH_SIZE
+                            forceAging = forceAging || command.force
+                        }
+                        is Command.AgingFinished -> finishAging(command)
+                        Command.Persist -> persistIfChanged(force = true)
+                        Command.Wake -> wakeScheduled = false
+                        Command.Stop -> {
+                            closeAndFailPending(stopCause)
+                            persistIfChanged(force = true)
+                            return
+                        }
                     }
-                    is Command.Finished -> finish(command)
-                    is Command.AgeUnregistered -> {
-                        agingBudget = WAIT_GROUP_AGING_BATCH_SIZE
-                        forceAging = forceAging || command.force
-                    }
-                    is Command.AgingFinished -> finishAging(command)
-                    Command.Persist -> persistIfChanged(force = true)
-                    Command.Wake -> wakeScheduled = false
-                    Command.Stop -> {
-                        persistIfChanged(force = true)
-                        commands.close()
-                        return
-                    }
-                }
-                scheduleNext()
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (error: Throwable) {
-                // Queue work is best-effort: retain the ring and wait for the next command/tick.
-                Log.e(WAIT_GROUP_TAG, "ring command ignored after failure: $command", error)
-                if (command is Command.Push && !command.insertedLength.isCompleted) {
-                    command.insertedLength.complete(ringSize())
+                    if (!stopped) scheduleNext()
+                } catch (cancelled: CancellationException) {
+                    command.reply()?.completeExceptionally(cancelled)
+                    throw cancelled
+                } catch (error: Throwable) {
+                    // Fail every reply rather than reporting success or leaving the caller hanging.
+                    command.reply()?.completeExceptionally(error)
+                    Log.e(WAIT_GROUP_TAG, "ring command failed: $command", error)
+                    if (command == Command.Stop) return
                 }
             }
+        } catch (error: Throwable) {
+            stopCause = error
+            throw error
+        } finally {
+            closeAndFailPending(stopCause)
+            while (true) {
+                val pending = commands.tryReceive().getOrNull() ?: break
+                pending.reply()?.completeExceptionally(stopCause)
+            }
+            scope.cancel()
         }
     }
 
@@ -989,6 +1023,10 @@ class WaitGroup(
                 allocateCacheIndex()
             } else 0L
         )
+        if (request.approvalState == WaitApprovalState.Ignored) {
+            node.cacheNode = cacheNode?.takeIf { it.orderCode == request.orderCode }
+                ?.copy(cacheIndex = node.cacheIndex)
+        }
         val cursor = current
         if (cursor == null) {
             node.next = node
@@ -1000,6 +1038,21 @@ class WaitGroup(
         size += 1
         revision += 1
         length.value = size
+        publishIgnored(node)
+    }
+
+    private fun Node.ignoredSnapshot(): IgnoredOrderSnapshot = IgnoredOrderSnapshot(
+        nodeId = id,
+        orderCode = request.orderCode,
+        cacheNode = cacheNode,
+        createdAtEpochMs = createdAtEpochMs,
+        cacheIndex = cacheIndex
+    )
+
+    private fun publishIgnored(node: Node) {
+        if (node.approvalState == WaitApprovalState.Ignored) {
+            ignoredReadIndex.publish(node.ignoredSnapshot())
+        }
     }
 
     private fun find(id: String): Node? = nodes().firstOrNull { it.id == id }
@@ -1021,8 +1074,11 @@ class WaitGroup(
 
     private fun isExpiredIgnoredCache(target: Node, nowEpochMs: Long): Boolean {
         if (target.approvalState != WaitApprovalState.Ignored) return false
-        val cachedAt = target.cacheNode?.cachedAtEpochMs ?: return false
-        return isIgnoredCacheExpired(cachedAt, nowEpochMs)
+        return isIgnoredNodeExpired(
+            createdAtEpochMs = target.createdAtEpochMs,
+            cachedAtEpochMs = target.cacheNode?.cachedAtEpochMs,
+            nowEpochMs = nowEpochMs
+        )
     }
 
     private fun remove(target: Node): Boolean {
@@ -1059,7 +1115,8 @@ class WaitGroup(
         revision += 1
         length.value = size
         if (target.approvalState == WaitApprovalState.Ignored) {
-            removeCacheIndex(target.request.orderCode)
+            ignoredReadIndex.remove(target.request.orderCode, target.id, target.cacheIndex)
+            removeCacheIndex(target.request.orderCode, target.cacheIndex)
         }
         return true
     }
@@ -1118,8 +1175,8 @@ class WaitGroup(
     private fun ringRevision(): Long = revision
 
     private fun restore() {
-        val raw = preferences.getString(WAIT_GROUP_SNAPSHOT, null) ?: return
         runCatching {
+            val raw = preferences.getString(WAIT_GROUP_SNAPSHOT, null) ?: return
             val root = JSONObject(raw)
             val schema = root.optInt("schema")
             require(schema in 1..10)
@@ -1129,6 +1186,9 @@ class WaitGroup(
                 root.optLong("next_cache_index", 1L).coerceAtLeast(1L)
             } else 1L
             val records = root.getJSONArray("nodes")
+            // Schema 9 -> 10 used to rewrite the entire cache preferences file per node.
+            // Stage migration in one editor and commit only after the whole ring is validated.
+            var migrationEditor: android.content.SharedPreferences.Editor? = null
             var last: Node? = null
             repeat(records.length()) { index ->
                 val item = records.getJSONObject(index)
@@ -1157,17 +1217,30 @@ class WaitGroup(
                         .takeIf { it > 0L } ?: allocateCacheIndex()
                     else allocateCacheIndex()
                 } else 0L
+                if (restoredCacheIndex >= nextCacheIndex) nextCacheIndex = restoredCacheIndex + 1L
+                val storedCache = readCacheIndex(item.getString("order_code"))
+                    ?: if (schema in 7..8 && !item.isNull("cache_node")) {
+                        item.getJSONObject("cache_node").toBreakfastRightCacheNode(
+                            fallbackCachedAtEpochMs = migratedCacheTimestamp
+                        )
+                    } else null
+                val restoredCache = when {
+                    storedCache == null -> null
+                    storedCache.cacheIndex == restoredCacheIndex -> storedCache
+                    schema < 10 || storedCache.cacheIndex == 0L ->
+                        storedCache.copy(cacheIndex = restoredCacheIndex)
+                    else -> null // A different nonzero generation is not a migration.
+                }
+                if (restoredCache != null && (restoredCache !== storedCache || schema in 7..8)) {
+                    val editor = migrationEditor ?: cacheIndexPreferences.edit().also { migrationEditor = it }
+                    editor.putString(restoredCache.orderCode, restoredCache.toJson().toString())
+                }
                 val node = Node(
                     id = item.getString("id"),
                     request = WaitGroupRequest(item.getString("order_code"), task),
                     createdAtEpochMs = item.getLong("created_at"),
                     approvalState = approvalState,
-                    cacheNode = readCacheIndex(item.getString("order_code"))
-                        ?: if (schema in 7..8 && !item.isNull("cache_node")) {
-                            item.getJSONObject("cache_node").toBreakfastRightCacheNode(
-                                fallbackCachedAtEpochMs = migratedCacheTimestamp
-                            )?.also(::writeCacheIndex)
-                        } else null,
+                    cacheNode = restoredCache,
                     approvalResponseText = if (schema >= 5 && !item.isNull("approval_response")) {
                         item.optString("approval_response").takeIf(String::isNotBlank)
                     } else {
@@ -1181,21 +1254,26 @@ class WaitGroup(
                     },
                     cacheIndex = restoredCacheIndex
                 )
-                if (node.cacheNode != null && node.cacheNode!!.cacheIndex != restoredCacheIndex) {
-                    node.cacheNode = node.cacheNode!!.copy(cacheIndex = restoredCacheIndex)
-                    writeCacheIndex(node.cacheNode!!)
-                }
                 if (current == null) current = node else last?.next = node
                 last = node
                 size += 1
+                publishIgnored(node)
             }
             if (current != null) last?.next = current
+            val migrationSaved = migrationEditor?.commit() ?: true
             lastSnapshotHash = if (schema == 10) raw.sha256() else ""
-            if (schema in 1..9) persistIfChanged(force = true)
+            if (migrationSaved) {
+                if (schema in 1..9) persistIfChanged(force = true)
+            } else {
+                Log.e(WAIT_GROUP_TAG, "cache index migration commit failed; keeping legacy disk snapshot")
+            }
         }.onFailure {
+            ignoredReadIndex.clear()
             current = null
             size = 0
             revision = 0
+            nextCacheIndex = 1L
+            lastSnapshotHash = ""
             Log.e(WAIT_GROUP_TAG, "discarding invalid persisted ring", it)
         }
     }
@@ -1215,7 +1293,14 @@ class WaitGroup(
             .commit()
     }
 
-    private fun removeCacheIndex(orderCode: String) {
+    private fun removeCacheIndex(orderCode: String, cacheIndex: Long) {
+        // A late unlink must not remove the disk cache belonging to a replacement node either.
+        if (nodes().any {
+                it.approvalState == WaitApprovalState.Ignored && it.request.orderCode == orderCode
+            }
+        ) return
+        val cached = readCacheIndex(orderCode)
+        if (cached != null && cached.cacheIndex != cacheIndex) return
         cacheIndexPreferences.edit().remove(orderCode).commit()
     }
 }
@@ -1278,6 +1363,17 @@ internal fun isIgnoredCacheExpired(cachedAtEpochMs: Long, nowEpochMs: Long): Boo
     cachedAtEpochMs > 0L &&
         nowEpochMs >= cachedAtEpochMs &&
         nowEpochMs - cachedAtEpochMs > IGNORED_CACHE_MAX_AGE_MS
+
+/**
+ * State 3 has a hard lifetime from node creation, even when cache refill never succeeds.
+ * A successfully filled cache keeps its own existing TTL as an additional expiry condition.
+ */
+internal fun isIgnoredNodeExpired(
+    createdAtEpochMs: Long,
+    cachedAtEpochMs: Long?,
+    nowEpochMs: Long
+): Boolean = isIgnoredCacheExpired(createdAtEpochMs, nowEpochMs) ||
+    (cachedAtEpochMs != null && isIgnoredCacheExpired(cachedAtEpochMs, nowEpochMs))
 
 private fun JSONObject.putNullable(name: String, value: Any?) {
     put(name, value ?: JSONObject.NULL)

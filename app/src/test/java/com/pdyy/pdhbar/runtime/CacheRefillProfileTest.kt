@@ -15,4 +15,18 @@ class CacheRefillProfileTest {
         assertEquals(CacheRefillProfile(256, 1), cacheRefillProfile(512, false, 1))
         assertEquals(CacheRefillProfile(512, 2), cacheRefillProfile(1024, false, 8))
     }
+
+    @Test
+    fun configuredMinimumRaisesConcurrencyToFour() {
+        assertEquals(
+            CacheRefillProfile(64, 4),
+            cacheRefillProfile(128, true, 1, DEFAULT_INDEXED_BOUNDED_MIN_WORKERS)
+        )
+    }
+
+    @Test
+    fun configuredMinimumCanBeChangedOrRemoved() {
+        assertEquals(CacheRefillProfile(128, 6), cacheRefillProfile(256, false, 8, 6))
+        assertEquals(CacheRefillProfile(128, 1), cacheRefillProfile(256, false, 8, null))
+    }
 }

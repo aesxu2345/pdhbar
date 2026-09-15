@@ -71,7 +71,7 @@ Content-Type: application/json; charset=utf-8
 
 ```json
 {
-  "order_code": "2608130090",
+  "order_code": "T202607010001",
   "card_no": "123456"
 }
 ```
@@ -90,12 +90,12 @@ Content-Type: application/json; charset=utf-8
   "code": 200,
   "msg": "ok",
   "data": {
-    "order_code": "2608130090",
+    "order_code": "T202607010001",
     "card_no": "123456",
     "name_b64": "5byg5LiJ",
     "sex_b64": "55S3",
     "phone": "138****8888",
-    "avatar_url": "/avatars/2608130090.jpg",
+    "avatar_url": "/avatars/T202607010001.jpg",
     "birth_date": "1990-01-01",
     "package_name_b64": "5L2T5qOA5aWX6aSQ",
     "exam_type_b64": "5YWl6IGM5L2T5qOA",
@@ -164,13 +164,13 @@ breakfast_status = 1
 ### 3.2 登记请求
 
 ```http
-GET /change_breakfast_status?order_code=2608130090&breakfast_status=1&breakfast_remark=PDA%E6%89%AB%E7%A0%81%E6%A0%B8%E9%94%80%E6%97%A9%E9%A4%90
+GET /change_breakfast_status?order_code=T202607010001&breakfast_status=1&breakfast_remark=PDA%E6%89%AB%E7%A0%81%E6%A0%B8%E9%94%80%E6%97%A9%E9%A4%90
 ```
 
 ### 3.3 取消请求
 
 ```http
-GET /change_breakfast_status?order_code=2608130090&breakfast_status=0&breakfast_remark=PDA%E5%8F%96%E6%B6%88%E6%97%A9%E9%A4%90%E6%A0%B8%E9%94%80
+GET /change_breakfast_status?order_code=T202607010001&breakfast_status=0&breakfast_remark=PDA%E5%8F%96%E6%B6%88%E6%97%A9%E9%A4%90%E6%A0%B8%E9%94%80
 ```
 
 | 查询参数 | 类型 | 必要性 | 说明 |
@@ -229,11 +229,11 @@ Content-Type: application/json; charset=utf-8
 ```json
 [
   {
-    "order_code": "2608130090",
+    "order_code": "T202607010001",
     "created_at": 1785290000000
   },
   {
-    "order_code": "2608130091",
+    "order_code": "T202607010002",
     "created_at": 1785290001000
   }
 ]

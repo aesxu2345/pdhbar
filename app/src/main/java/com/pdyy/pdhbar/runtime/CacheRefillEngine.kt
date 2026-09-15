@@ -8,8 +8,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -20,6 +23,7 @@ import kotlin.concurrent.withLock
 private const val CACHE_REFILL_TAG = "CacheRefillEngine"
 private const val CACHE_REFILL_FALLBACK_MS = 60L * 60L * 1_000L
 private const val CACHE_REFILL_REQUEST_GAP_MS = 250L
+private const val CACHE_REFILL_STATUS_MS = 30_000L
 private const val LEGACY_BATCH_SIZE = 12
 
 data class CacheRefillProfile(
@@ -32,19 +36,31 @@ data class CacheRefillProfile(
     }
 }
 
-internal fun cacheRefillProfile(context: Context): CacheRefillProfile {
+internal fun cacheRefillProfile(
+    context: Context,
+    configuredMinWorkers: Int? = null
+): CacheRefillProfile {
     val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-    return cacheRefillProfile(
+    val processors = Runtime.getRuntime().availableProcessors()
+    val profile = cacheRefillProfile(
         memoryMb = manager.memoryClass,
         lowRam = manager.isLowRamDevice,
-        processors = Runtime.getRuntime().availableProcessors()
+        processors = processors,
+        configuredMinWorkers = configuredMinWorkers
     )
+    Log.i(
+        CACHE_REFILL_TAG,
+        "device profile memoryClassMb=${manager.memoryClass} lowRam=${manager.isLowRamDevice} " +
+            "processors=$processors buffer=${profile.bufferSize} workers=${profile.workerCount}"
+    )
+    return profile
 }
 
 internal fun cacheRefillProfile(
     memoryMb: Int,
     lowRam: Boolean,
-    processors: Int
+    processors: Int,
+    configuredMinWorkers: Int? = null
 ): CacheRefillProfile {
     val availableProcessors = processors.coerceAtLeast(1)
     val base = when {
@@ -53,8 +69,16 @@ internal fun cacheRefillProfile(
         memoryMb <= 512 -> CacheRefillProfile(256, 2)
         else -> CacheRefillProfile(512, 2)
     }
-    return base.copy(workerCount = minOf(base.workerCount, availableProcessors, 2))
+    val memoryEvaluatedWorkers = minOf(base.workerCount, availableProcessors, 2)
+    val workerCount = configuredMinWorkers
+        ?.coerceIn(1, MAX_CONFIGURED_CACHE_WORKERS)
+        ?.let { maxOf(memoryEvaluatedWorkers, it) }
+        ?: memoryEvaluatedWorkers
+    return base.copy(workerCount = workerCount)
 }
+
+internal const val DEFAULT_INDEXED_BOUNDED_MIN_WORKERS = 4
+internal const val MAX_CONFIGURED_CACHE_WORKERS = 32
 
 enum class CacheRefillEngineKind { IndexedBounded, LegacyPolling }
 
@@ -68,6 +92,8 @@ interface CacheRefillEngine {
     fun start()
     fun signal()
     fun stop()
+    /** Configuration replacement must wait for old HTTP work, not merely request cancellation. */
+    suspend fun stopAndJoin()
 }
 
 internal data class CacheRefillWorkToken(val cacheIndex: Long, val generation: Long)
@@ -91,12 +117,13 @@ object CacheRefillEngineFactory {
     fun create(
         kind: CacheRefillEngineKind,
         context: Context,
+        configuredMinWorkers: Int?,
         waitGroup: WaitGroupIO,
         query: suspend (String) -> WaitGroupExecutionResult,
         onObserved: (IgnoredPoolObservation) -> Unit
     ): CacheRefillEngine = when (kind) {
         CacheRefillEngineKind.IndexedBounded -> IndexedBoundedCacheRefillEngine(
-            profile = cacheRefillProfile(context),
+            profile = cacheRefillProfile(context, configuredMinWorkers),
             waitGroup = waitGroup,
             query = query,
             onObserved = onObserved
@@ -116,7 +143,7 @@ object CacheRefillEngineFactory {
  * state. One lock protects the tree and transitions, and is never held across HTTP, persistence,
  * delay, logging, or callbacks. Workers revalidate each key before and after external work.
  */
-private class IndexedBoundedCacheRefillEngine(
+internal class IndexedBoundedCacheRefillEngine(
     private val profile: CacheRefillProfile,
     private val waitGroup: WaitGroupIO,
     private val query: suspend (String) -> WaitGroupExecutionResult,
@@ -139,24 +166,43 @@ private class IndexedBoundedCacheRefillEngine(
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val signals = Channel<Unit>(Channel.CONFLATED)
+    private val completions = Channel<Unit>(Channel.CONFLATED)
     private val tasks = Channel<CacheRefillWorkToken>(profile.bufferSize)
     private val stateLock = ReentrantLock()
     private val states = TreeMap<Long, KeyState>()
     private var nextGeneration = 1L
     private var nextLeaseId = 1L
     private var coordinator: Job? = null
+    @Volatile private var coordinatorPhase = "not-started"
+    @Volatile private var lastObservation: IgnoredPoolObservation? = null
+    @Volatile private var lastObservationAt = 0L
     private val workers = ArrayList<Job>(profile.workerCount)
 
     override fun start() {
+        if (!scope.isActive) return
         if (coordinator?.isActive == true) return
-        repeat(profile.workerCount) { workerId ->
+        repeat(profile.workerCount) { workerSlot ->
+            val workerId = workerSlot + 1
             workers += scope.launch { workerLoop(workerId) }
         }
         coordinator = scope.launch { coordinatorLoop() }
-        signal()
+        scope.launch {
+            while (isActive) {
+                delay(CACHE_REFILL_STATUS_MS)
+                val counts = stateLock.withLock {
+                    KeyPhase.entries.map { phase -> states.values.count { it.phase == phase } }
+                }
+                Log.i(CACHE_REFILL_TAG,
+                    "indexed status workers=${profile.workerCount} coordinator=${coordinator?.isActive} " +
+                        "phase=$coordinatorPhase queued=${counts[0]} running=${counts[1]} committing=${counts[2]} " +
+                        "lastTotal=${lastObservation?.totalCount} lastMissing=${lastObservation?.missingCount} " +
+                        "observedAt=$lastObservationAt")
+            }
+        }
         Log.i(
             CACHE_REFILL_TAG,
-            "indexed bounded engine started buffer=${profile.bufferSize} workers=${profile.workerCount}"
+            "indexed bounded engine started buffer=${profile.bufferSize} " +
+                "workerCount=${profile.workerCount} workerIds=1..${profile.workerCount}"
         )
     }
 
@@ -165,46 +211,61 @@ private class IndexedBoundedCacheRefillEngine(
     }
 
     override fun stop() {
-        coordinator?.cancel()
-        workers.forEach(Job::cancel)
+        scope.cancel()
+        tasks.cancel()
+        signals.cancel()
+        completions.cancel()
+        Log.i(CACHE_REFILL_TAG, "indexed engine stopping workers=${profile.workerCount}")
+    }
+
+    override suspend fun stopAndJoin() {
+        stop()
+        scope.coroutineContext[Job]?.join()
+        stateLock.withLock { states.clear() }
         workers.clear()
-        tasks.close()
-        signals.close()
+        Log.i(CACHE_REFILL_TAG, "indexed engine stopped workers=${profile.workerCount}")
     }
 
     private suspend fun coordinatorLoop() {
         while (scope.isActive) {
-            refreshIndex()
+            var afterIndex = 0L
+            try {
+                while (scope.isActive) {
+                    coordinatorPhase = "observing"
+                    val nextIndex = refreshIndex(afterIndex) ?: break
+                    afterIndex = nextIndex
+                    coordinatorPhase = "draining-batch"
+                    // Completion only wakes the coordinator. Never scan the ring per worker result.
+                    while (stateLock.withLock { states.isNotEmpty() }) completions.receive()
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w(CACHE_REFILL_TAG, "indexed pass failed; awaiting next signal", error)
+            }
+            coordinatorPhase = "waiting-signal-or-hourly"
+            Log.i(CACHE_REFILL_TAG,
+                "indexed pass finished workers=${profile.workerCount} lastIndex=$afterIndex; " +
+                    "failed nodes retry on next external signal/hourly pass")
             withTimeoutOrNull(CACHE_REFILL_FALLBACK_MS) { signals.receive() }
         }
     }
 
-    private suspend fun refreshIndex() {
-        val snapshots = try {
-            waitGroup.ignoredOrderSnapshots()
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (error: Throwable) {
-            Log.w(CACHE_REFILL_TAG, "indexed state-3 observation failed", error)
-            return
-        }
+    private suspend fun refreshIndex(afterIndex: Long): Long? {
+        val snapshots = waitGroup.ignoredOrderSnapshots()
         val now = System.currentTimeMillis()
         val observation = IgnoredPoolObservation(
             totalCount = snapshots.size,
             recentCount = snapshots.count { isRecentIgnoredNode(it.createdAtEpochMs, now) },
             missingCount = snapshots.count { it.cacheNode == null }
         )
+        lastObservation = observation
+        lastObservationAt = now
         onObserved(observation)
 
-        val candidates = snapshots.asSequence()
-            .filter { it.cacheNode == null && it.cacheIndex > 0L }
-            .toList()
-        val liveIndexes = snapshots.asSequence().map { it.cacheIndex }.filter { it > 0L }.toSet()
+        val candidates = selectIndexedRefillBatch(snapshots, afterIndex, profile.bufferSize)
         val accepted = ArrayList<CacheRefillWorkToken>()
         stateLock.withLock {
-            states.entries.removeAll { (cacheIndex, state) ->
-                cacheIndex !in liveIndexes && state.phase == KeyPhase.Queued
-            }
             candidates.forEach { node ->
                 if (states.size >= profile.bufferSize || states.containsKey(node.cacheIndex)) {
                     return@forEach
@@ -233,8 +294,10 @@ private class IndexedBoundedCacheRefillEngine(
         Log.i(
             CACHE_REFILL_TAG,
             "indexed refresh total=${observation.totalCount} recent=${observation.recentCount} " +
-                "missing=${observation.missingCount} scheduled=${accepted.size}"
+                "missing=${observation.missingCount} scheduled=${accepted.size} " +
+                "workerCount=${profile.workerCount}"
         )
+        return candidates.lastOrNull()?.cacheIndex
     }
 
     private suspend fun workerLoop(workerId: Int) {
@@ -258,7 +321,10 @@ private class IndexedBoundedCacheRefillEngine(
                 }
             } ?: continue
             try {
+                Log.d(CACHE_REFILL_TAG, "worker=$workerId index=${work.identity.cacheIndex} phase=requesting")
                 val result = query(work.orderCode)
+                // Blocking I/O or a callback can return after cancellation without suspending.
+                currentCoroutineContext().ensureActive()
                 val parsed = if (result.completed && result.success) {
                     result.responseText?.let(::parseBreakfastRightCacheNode)
                 } else null
@@ -274,6 +340,7 @@ private class IndexedBoundedCacheRefillEngine(
                         }?.also { it.phase = KeyPhase.Committing } != null
                     }
                     if (mayCommit) {
+                        currentCoroutineContext().ensureActive()
                         val indexedCache = parsed.copy(cacheIndex = work.identity.cacheIndex)
                         val updated = waitGroup.overwriteIgnoredCache(
                             nodeId = work.nodeId,
@@ -315,6 +382,7 @@ private class IndexedBoundedCacheRefillEngine(
                         ) && it.phase != KeyPhase.Queued
                     }?.let { states.remove(work.identity.cacheIndex) }
                 }
+                completions.trySend(Unit)
             }
             delay(CACHE_REFILL_REQUEST_GAP_MS)
         }
@@ -333,6 +401,7 @@ private class LegacyPollingCacheRefillEngine(
     private var cursor = 0
 
     override fun start() {
+        if (!scope.isActive) return
         if (job?.isActive == true) return
         job = scope.launch {
             while (isActive) {
@@ -348,8 +417,13 @@ private class LegacyPollingCacheRefillEngine(
     }
 
     override fun stop() {
-        job?.cancel()
-        signals.close()
+        scope.cancel()
+        signals.cancel()
+    }
+
+    override suspend fun stopAndJoin() {
+        stop()
+        scope.coroutineContext[Job]?.join()
     }
 
     private suspend fun bruteForceScanOnce() {
@@ -366,6 +440,7 @@ private class LegacyPollingCacheRefillEngine(
         cursor = batch.nextIndex
         batch.nodes.forEach { node ->
             val result = query(node.orderCode)
+            currentCoroutineContext().ensureActive()
             val parsed = if (result.completed && result.success) {
                 result.responseText?.let(::parseBreakfastRightCacheNode)
             } else null

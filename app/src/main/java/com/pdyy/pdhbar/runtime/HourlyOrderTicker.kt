@@ -10,6 +10,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import java.time.Instant
 import java.time.LocalDate
@@ -32,31 +34,60 @@ class HourlyOrderTicker(
     initialTickerNetTarget: NetTarget,
     private val tickerWaitGroup: WaitGroupIO,
     private val notifyOperator: (String) -> Unit = {},
-    cacheRefillEngineKind: CacheRefillEngineKind = CacheRefillEngineKind.IndexedBounded
+    private val cacheRefillEngineKind: CacheRefillEngineKind = CacheRefillEngineKind.IndexedBounded,
+    configuredMinWorkers: Int? = DEFAULT_INDEXED_BOUNDED_MIN_WORKERS
 ) {
+    private val applicationContext = context.applicationContext
     private val tickerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val tickerNetTarget = initialTickerNetTarget.copy(retry = TICKER_NETWORK_RETRY_COUNT)
     private val tickerPostman = Postman(tickerNetTarget)
     private val immediateRangeRequests = Channel<Unit>(Channel.CONFLATED)
     private var rangeTickerJob: Job? = null
     private var previouslyHadRecentNode: Boolean? = null
-    private val cacheRefillEngine = CacheRefillEngineFactory.create(
+    private val engineLifecycle = Mutex()
+    @Volatile
+    private var configuredMinWorkers = configuredMinWorkers
+    @Volatile
+    private var cacheRefillEngine = createCacheRefillEngine()
+
+    private fun createCacheRefillEngine() = CacheRefillEngineFactory.create(
         kind = cacheRefillEngineKind,
-        context = context.applicationContext,
+        context = applicationContext,
+        configuredMinWorkers = configuredMinWorkers,
         waitGroup = tickerWaitGroup,
         query = tickerPostman::queryBreakfastRightForTicker,
         onObserved = ::onIgnoredPoolObserved
     )
 
     fun start() {
+        Log.i(HOURLY_ORDER_TICKER_TAG, "start requested engine=$cacheRefillEngineKind minimumWorkers=$configuredMinWorkers")
         if (rangeTickerJob?.isActive != true) {
             rangeTickerJob = tickerScope.launch { runRangeTicker() }
         }
-        cacheRefillEngine.start()
+        tickerScope.launch {
+            engineLifecycle.withLock { cacheRefillEngine.start() }
+        }
     }
 
     fun updateBackendTarget(pipefall: PipeFallIO) {
         tickerPostman.onupdate(pipefall)
+    }
+
+    @Synchronized
+    fun updateConfiguredMinWorkers(value: Int?) {
+        if (configuredMinWorkers == value) return
+        configuredMinWorkers = value
+        tickerScope.launch {
+            engineLifecycle.withLock {
+                if (configuredMinWorkers != value) return@withLock
+                Log.i(HOURLY_ORDER_TICKER_TAG, "replacing refill engine minimumWorkers=$value; waiting for old workers")
+                cacheRefillEngine.stopAndJoin()
+                Log.i(HOURLY_ORDER_TICKER_TAG, "old refill workers joined minimumWorkers=$value")
+                if (configuredMinWorkers != value) return@withLock
+                cacheRefillEngine = createCacheRefillEngine()
+                cacheRefillEngine.start()
+            }
+        }
     }
 
     private suspend fun runRangeTicker() {

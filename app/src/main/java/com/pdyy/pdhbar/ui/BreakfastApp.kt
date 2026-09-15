@@ -48,7 +48,17 @@ fun BreakfastApp() {
                     Toast.makeText(context, command.message, Toast.LENGTH_SHORT).show()
                     customer = null
                 }
-                is UiCommand.ShowCustomer -> customer = command
+                is UiCommand.ShowCustomer -> {
+                    if (command.queryId == 0L || std.run().pipefall.isCurrentCustomerQuery(command.queryId)) {
+                        customer = command
+                    }
+                }
+                is UiCommand.CustomerQueryFailed -> {
+                    if (std.run().pipefall.isCurrentCustomerQuery(command.queryId)) {
+                        customer = null
+                        Toast.makeText(context, command.message, Toast.LENGTH_SHORT).show()
+                    }
+                }
                 UiCommand.CloseDialog -> customer = null
             }
         }

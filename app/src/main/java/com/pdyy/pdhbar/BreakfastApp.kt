@@ -18,6 +18,9 @@ import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
 import android.view.ViewGroup
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -73,6 +76,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -104,9 +108,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import coil3.compose.SubcomposeAsyncImage
 import coil3.compose.SubcomposeAsyncImageContent
 import com.pdyy.pdhbar.runtime.IPv4Address
+import com.pdyy.pdhbar.runtime.MAX_CONFIGURED_CACHE_WORKERS
 import com.pdyy.pdhbar.runtime.NetRoute
 import com.pdyy.pdhbar.runtime.UiCommand
 import com.pdyy.pdhbar.runtime.std
@@ -116,11 +123,13 @@ import com.uikit.insight.OnCardNo
 import com.uikit.insight.UIEventStruct
 import com.uikit.insight.UIInsightCss
 import com.uikit.insight.UIInsightPlayConfig
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -166,8 +175,7 @@ private fun createUIKitInsight(
     check(!insight.bypass) { "UIKit factory unexpectedly enabled route signature bypass" }
     Log.i(
         APP_TAG,
-        "UIKit signed-route verification enabled; " +
-            "firstRoute=${insight.firstRoute}, secondRoute=${insight.secondRoute}"
+        "UIKit signed-route verification enabled"
     )
     return insight
 }
@@ -175,9 +183,9 @@ private fun createUIKitInsight(
 private fun applyUIKitWaitGroupCorrection(
     insight: NewUIInsightPlay,
     waitGroupLength: Int
-) {
+): Boolean {
     val value = waitGroupLength.coerceAtLeast(0)
-    runCatching {
+    return runCatching {
         UIKitInsightFactory.updateScan2Fail(insight, value)
         val actualValue = UIKitInsightFactory.readScan2Fail(insight)
         check(actualValue == value) {
@@ -186,29 +194,44 @@ private fun applyUIKitWaitGroupCorrection(
         Log.d(APP_TAG, "WaitGroup length delivered to UIKit scan2fail: $value")
     }.onFailure { error ->
         Log.w(APP_TAG, "Unable to deliver WaitGroup length to UIKit scan2fail: $value", error)
-    }
+    }.isSuccess
 }
 
 private class UIKitInsightHostView(context: Context) : FrameLayout(context) {
-    var renderedWaitGroupLength: Int? = null
+    val mountState = InsightMountState()
 }
 
 private fun renderUIKitInsight(
     insight: NewUIInsightPlay,
     host: UIKitInsightHostView,
-    waitGroupLength: Int
+    waitGroupLength: Int,
+    onRendererGone: (crashed: Boolean) -> Unit
 ) {
-    val value = waitGroupLength.coerceAtLeast(0)
-    if (host.renderedWaitGroupLength == value) return
-
-    applyUIKitWaitGroupCorrection(insight, value)
-    host.removeAllViews()
-    insight.Display(host.context, host)
-    host.renderedWaitGroupLength = value
-    Log.d(
-        APP_TAG,
-        "UIKit visible view rendered: value=$value, " +
-            "insight=${System.identityHashCode(insight)}, host=${System.identityHashCode(host)}"
+    host.mountState.update(
+        insight,
+        waitGroupLength,
+        mount = {
+            host.removeAllViews()
+            val browser = insight.Display(host.context, host)
+            // The bundled AAR installs only a plain WebViewClient (verified in its bytecode).
+            browser.webViewClient = object : WebViewClient() {
+                override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                    Log.e(APP_TAG, "UIKit renderer gone: crashed=${detail.didCrash()}, priority=${detail.rendererPriorityAtExit()}")
+                    // Detach first: the new AAR cleans up the dead renderer but only offers
+                    // recovery/recreation when it still has a parent. Keep our scanner fallback.
+                    (view.parent as? ViewGroup)?.removeView(view)
+                    try {
+                        insight.onRenderProcessGone(view, detail)
+                    } catch (error: Exception) {
+                        Log.e(APP_TAG, "UIKit renderer cleanup failed", error)
+                    } finally {
+                        onRendererGone(detail.didCrash())
+                    }
+                    return true
+                }
+            }
+        },
+        correct = { applyUIKitWaitGroupCorrection(insight, it) }
     )
 }
 
@@ -218,7 +241,8 @@ private data class UiJsonSettings(
     val port: Int,
     val insightPanelAddress: String,
     val insightFirstRoute: String,
-    val insightSecondRoute: String
+    val insightSecondRoute: String,
+    val indexedBoundedMinWorkers: Int?
 )
 
 private val OpenSourceLicenseText = """
@@ -303,29 +327,91 @@ private val DialogTextButtonColors
         disabledContentColor = FlashlightGreen.copy(alpha = 0.45f)
     )
 
+private fun reportUiFailure(context: Context, message: String, error: Exception) {
+    Log.e(APP_TAG, message, error)
+    val notify = Runnable {
+        try {
+            Toast.makeText(context.applicationContext, message, Toast.LENGTH_LONG).show()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (toastError: Exception) {
+            Log.e(APP_TAG, "Unable to show failure toast", toastError)
+        }
+    }
+    if (Looper.myLooper() == Looper.getMainLooper()) {
+        notify.run()
+    } else {
+        try {
+            Handler(Looper.getMainLooper()).post(notify)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (postError: Exception) {
+            Log.e(APP_TAG, "Unable to post failure toast", postError)
+        }
+    }
+}
+
+private fun releaseScannerResources(vararg releases: () -> Unit) {
+    var cancellation: CancellationException? = null
+    releases.forEach { release ->
+        try {
+            release()
+        } catch (cancelled: CancellationException) {
+            if (cancellation == null) cancellation = cancelled
+        } catch (error: Exception) {
+            Log.w(APP_TAG, "Unable to release scanner resource", error)
+        }
+    }
+    cancellation?.let { throw it }
+}
+
 private class ScannerGate<T>(
     context: Context,
-    private val action: (T) -> Unit
+    private val action: (T, ScannerGate<T>) -> Unit
 ) {
     private val appContext = context.applicationContext
     private val handler = Handler(Looper.getMainLooper())
     private val lockedAt = AtomicLong(0L)
     private val cancelled = AtomicBoolean(false)
 
-    fun submit(value: T) {
+    fun submit(value: T, isActive: () -> Boolean = { true }) {
         // The first decoded result owns the gate immediately. Do not wait for the
         // query coroutine or customer dialog to update Compose state. A stale lock
         // can be atomically replaced after seven seconds, so it cannot deadlock.
-        if (cancelled.get() || !tryAcquire()) return
-        handler.post {
-            if (cancelled.get()) return@post
-            if (!appContext.isWifiConnected()) {
-                Toast.makeText(appContext, "WiFi未连接", Toast.LENGTH_SHORT).show()
-                lockedAt.set(0L)
-                return@post
+        try {
+            if (cancelled.get() || !isActive() || !tryAcquire()) return
+            val acquiredAt = lockedAt.get()
+            val posted = handler.post {
+                try {
+                    if (cancelled.get() || !isActive()) {
+                        lockedAt.compareAndSet(acquiredAt, 0L)
+                        return@post
+                    }
+                    if (!appContext.isWifiConnected()) {
+                        lockedAt.compareAndSet(acquiredAt, 0L)
+                        Toast.makeText(appContext, "WiFi未连接", Toast.LENGTH_SHORT).show()
+                        return@post
+                    }
+                    action(value, this)
+                } catch (cancelled: CancellationException) {
+                    lockedAt.compareAndSet(acquiredAt, 0L)
+                    throw cancelled
+                } catch (error: Exception) {
+                    releaseAfterFailure(error)
+                }
             }
-            action(value)
+            if (!posted) lockedAt.compareAndSet(acquiredAt, 0L)
+        } catch (cancelled: CancellationException) {
+            lockedAt.set(0L)
+            throw cancelled
+        } catch (error: Exception) {
+            releaseAfterFailure(error)
         }
+    }
+
+    fun releaseAfterFailure(error: Exception) {
+        setBlocked(false)
+        reportUiFailure(appContext, "扫码处理失败，请重试", error)
     }
 
     fun setBlocked(blocked: Boolean) {
@@ -377,17 +463,21 @@ private fun Context.isWifiConnected(): Boolean {
 }
 
 private fun beepOnScan(scanPlayer: MediaPlayer) {
-    runCatching {
+    try {
         if (scanPlayer.isPlaying) {
             scanPlayer.seekTo(0)
         } else {
             scanPlayer.start()
         }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        Log.w(APP_TAG, "Unable to play scan feedback", error)
     }
 }
 
 private fun vibrateOnScan(context: Context) {
-    runCatching {
+    try {
         val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             context.getSystemService(VibratorManager::class.java)?.defaultVibrator
         } else {
@@ -403,6 +493,10 @@ private fun vibrateOnScan(context: Context) {
             @Suppress("DEPRECATION")
             vibrator.vibrate(70L)
         }
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (error: Exception) {
+        Log.w(APP_TAG, "Unable to vibrate on scan", error)
     }
 }
 
@@ -463,11 +557,17 @@ private fun writeInsightRoutes(context: Context, firstRoute: String, secondRoute
 }
 
 private fun UiJsonSettings.toPrettyJson(): String {
-    return JSONObject()
+    val root = JSONObject()
         .put("backendApi", JSONObject().put("scheme", scheme).put("host", host).put("port", port))
         .put("insightPanelAddress", insightPanelAddress)
         .put("insightRoutes", JSONObject().put("firstRoute", insightFirstRoute).put("secondRoute", insightSecondRoute))
-        .toString(2)
+    indexedBoundedMinWorkers?.let {
+        root.put(
+            "runtimeSharedConfig",
+            JSONObject().put("indexedBoundedMinWorkers", it)
+        )
+    }
+    return root.toString(2)
 }
 
 private fun parseUiJsonSettings(text: String): Result<UiJsonSettings> {
@@ -481,6 +581,16 @@ private fun parseUiJsonSettings(text: String): Result<UiJsonSettings> {
         val insightRoutes = root.optJSONObject("insightRoutes") ?: throw JSONException("缺少 insightRoutes 对象")
         val insightFirstRoute = insightRoutes.optString("firstRoute").trim()
         val insightSecondRoute = insightRoutes.optString("secondRoute").trim()
+        val runtimeSharedConfig = root.optJSONObject("runtimeSharedConfig")
+        val indexedBoundedMinWorkers = if (
+            runtimeSharedConfig?.has("indexedBoundedMinWorkers") == true
+        ) {
+            runtimeSharedConfig.optInt("indexedBoundedMinWorkers", -1).also {
+                require(it in 1..MAX_CONFIGURED_CACHE_WORKERS) {
+                    "runtimeSharedConfig.indexedBoundedMinWorkers 必须在 1..$MAX_CONFIGURED_CACHE_WORKERS"
+                }
+            }
+        } else null
 
         require(scheme == "http" || scheme == "https") { "backendApi.scheme 只能是 http 或 https" }
         require(host.isNotBlank()) { "backendApi.host 不能为空" }
@@ -495,7 +605,8 @@ private fun parseUiJsonSettings(text: String): Result<UiJsonSettings> {
             port = port,
             insightPanelAddress = insightPanelAddress,
             insightFirstRoute = insightFirstRoute,
-            insightSecondRoute = insightSecondRoute
+            insightSecondRoute = insightSecondRoute,
+            indexedBoundedMinWorkers = indexedBoundedMinWorkers
         )
     }
 }
@@ -517,26 +628,89 @@ fun BreakfastApp() {
     var insightPanelAddress by remember { mutableStateOf(readInsightPanelAddress(context)) }
     var insightFirstRoute by remember { mutableStateOf(readInsightFirstRoute(context)) }
     var insightSecondRoute by remember { mutableStateOf(readInsightSecondRoute(context)) }
+    val scanPlayer = remember(context) {
+        try {
+            MediaPlayer.create(context, R.raw.tingko)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            reportUiFailure(context, "扫码提示音初始化失败", error)
+            null
+        }
+    }
+    val scannerGate = remember(context, scope, scanPlayer) {
+        ScannerGate<String>(context) { code, gate ->
+            scope.launch {
+                try {
+                    std.run().barscanner.onScan(code)
+                    scanPlayer?.let { scanFeedback(context, it) }
+                } catch (cancelled: CancellationException) {
+                    gate.setBlocked(false)
+                    throw cancelled
+                } catch (error: Exception) {
+                    gate.releaseAfterFailure(error)
+                }
+            }
+        }
+    }
+    LaunchedEffect(scannerGate, customer != null || submittingBreakfast || queuedBreakfast != null) {
+        scannerGate.setBlocked(customer != null || submittingBreakfast || queuedBreakfast != null)
+    }
+    DisposableEffect(scannerGate, scanPlayer) {
+        onDispose {
+            releaseScannerResources({ scannerGate.cancel() }, { scanPlayer?.release() })
+        }
+    }
 
-    LaunchedEffect(Unit) {
-        std.run().pipefall.commands.collect { command ->
-            when (command) {
-                is UiCommand.Toast -> Toast.makeText(context, command.message, Toast.LENGTH_SHORT).show()
-                is UiCommand.SubmissionChanged -> {
-                    submittingBreakfast = command.submitting
-                    if (command.submitting) {
+    LaunchedEffect(scannerGate) {
+        val runtime = std.run()
+        runtime.pipefall.commands.collect { command ->
+            try {
+                when (command) {
+                    is UiCommand.Toast -> Toast.makeText(context, command.message, Toast.LENGTH_SHORT).show()
+                    is UiCommand.SubmissionChanged -> {
+                        submittingBreakfast = command.submitting
+                        if (command.submitting) {
+                            customer = null
+                            manualInputOpen = false
+                            backendDialogOpen = false
+                            licenseDialogOpen = false
+                        }
+                    }
+                    is UiCommand.BreakfastStatusQueued -> {
                         customer = null
-                        manualInputOpen = false
-                        backendDialogOpen = false
-                        licenseDialogOpen = false
+                        queuedBreakfast = command
+                    }
+                    is UiCommand.ShowCustomer -> {
+                        if (command.queryId == 0L || runtime.pipefall.isCurrentCustomerQuery(command.queryId)) {
+                            customer = command
+                        }
+                    }
+                    is UiCommand.CustomerQueryFailed -> {
+                        if (runtime.pipefall.isCurrentCustomerQuery(command.queryId)) {
+                            customer = null
+                            scannerGate.setBlocked(false)
+                            // Runtime already owns query failure cleanup; do not enqueue DialogCancel again.
+                            Toast.makeText(context, command.message, Toast.LENGTH_LONG).show()
+                        }
+                    }
+                    UiCommand.CloseDialog -> customer = null
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (command is UiCommand.ShowCustomer) {
+                    customer = null
+                    scannerGate.setBlocked(false)
+                    try {
+                        runtime.uifurge.onDialogCancelClick()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (cleanupError: Exception) {
+                        Log.e(APP_TAG, "Unable to finish failed ShowCustomer command", cleanupError)
                     }
                 }
-                is UiCommand.BreakfastStatusQueued -> {
-                    customer = null
-                    queuedBreakfast = command
-                }
-                is UiCommand.ShowCustomer -> customer = command
-                UiCommand.CloseDialog -> customer = null
+                reportUiFailure(context, "界面处理失败，请重试", error)
             }
         }
     }
@@ -556,11 +730,8 @@ fun BreakfastApp() {
         ScannerPreviewCard(
             modifier = Modifier.fillMaxSize(),
             scannerGunMode = scannerGunMode,
-            scanBlocked = customer != null || submittingBreakfast || queuedBreakfast != null,
+            scanGate = scannerGate,
             onBackToInsight = { uiLayerVisible = true },
-            onScanned = { code ->
-                std.run().barscanner.onScan(code)
-            },
             onPencilClick = {
                 std.run().uifurge.onPencilButtonClick()
                 manualInputOpen = true
@@ -587,11 +758,9 @@ fun BreakfastApp() {
                 insightPanelAddress = insightPanelAddress,
                 insightFirstRoute = insightFirstRoute,
                 insightSecondRoute = insightSecondRoute,
-                onInsightCardNo = { cardNo ->
+                onInsightCardNo = { cardNo, isActive ->
                     if (customer == null && !submittingBreakfast && queuedBreakfast == null) {
-                        scope.launch {
-                            std.run().barscanner.onScan(cardNo)
-                        }
+                        scannerGate.submit(cardNo, isActive)
                     }
                 }
             )
@@ -653,8 +822,14 @@ fun BreakfastApp() {
             value = manualCode,
             onValueChange = { manualCode = it },
             onSubmit = {
-                std.run().uifurge.onScanInput(manualCode.trim())
-                manualInputOpen = false
+                try {
+                    std.run().uifurge.onScanInput(manualCode.trim())
+                    manualInputOpen = false
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    scannerGate.releaseAfterFailure(error)
+                }
             },
             onDismiss = { manualInputOpen = false }
         )
@@ -675,6 +850,7 @@ fun BreakfastApp() {
                     route = NetRoute(scheme = settings.scheme, port = settings.port)
                 )
                 runtime.updateBackendTarget(systemPipe)
+                runtime.setIndexedBoundedMinWorkers(settings.indexedBoundedMinWorkers)
                 runtime.waitgroup.ageUnregistered(force = true)
                 insightPanelAddress = settings.insightPanelAddress
                 insightFirstRoute = settings.insightFirstRoute
@@ -718,44 +894,44 @@ private fun UIKitInsightLayer(
     insightPanelAddress: String,
     insightFirstRoute: String,
     insightSecondRoute: String,
-    onInsightCardNo: (String) -> Unit
+    onInsightCardNo: (String, () -> Boolean) -> Unit
 ) {
+    val insightContext = LocalContext.current
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val currentOnInsightCardNo by rememberUpdatedState(onInsightCardNo)
-    val eventHandler = remember(
-        onManualInputClick,
-        onBackendTargetClick,
-        onCameraInfraredSwitch,
-        onLicenseClick,
-        onOpenScanner
-    ) {
+    val currentManualInput by rememberUpdatedState(onManualInputClick)
+    val currentBackendTarget by rememberUpdatedState(onBackendTargetClick)
+    val currentCameraSwitch by rememberUpdatedState(onCameraInfraredSwitch)
+    val currentLicense by rememberUpdatedState(onLicenseClick)
+    val currentOpenScanner by rememberUpdatedState(onOpenScanner)
+    val eventHandler = remember {
         object : UIEventStruct() {
             override fun onManualBarcodeInput() {
-                onManualInputClick()
+                currentManualInput()
             }
 
             override fun onConfigureBackendAddress() {
-                onBackendTargetClick()
+                currentBackendTarget()
             }
 
             override fun onCameraInfraredSwitch() {
-                onCameraInfraredSwitch()
+                currentCameraSwitch()
             }
 
             override fun onOpenSourceLicenses() {
-                onLicenseClick()
+                currentLicense()
             }
 
             override fun onScanRegistration() {
-                onOpenScanner()
+                currentOpenScanner()
             }
 
             override fun onSettings() {
-                onBackendTargetClick()
+                currentBackendTarget()
             }
 
             override fun onOpenScanner() {
-                onOpenScanner()
+                currentOpenScanner()
             }
         }
     }
@@ -774,22 +950,43 @@ private fun UIKitInsightLayer(
         ).also { it.OnClickUIEvent(eventHandler) }
     }
 
+    val active = remember(insight) { AtomicBoolean(true) }
+    var displayFailureReason by remember(insight) { mutableStateOf<String?>(null) }
     DisposableEffect(insight) {
         val cardNoExecutor = Executors.newSingleThreadExecutor()
         insight.OnCardNo.enroll(
             object : OnCardNo() {
                 override fun event(str: String) {
+                    if (!active.get()) return
                     str.takeIf(String::isNotBlank)?.let { cardNo ->
-                        mainHandler.post { currentOnInsightCardNo(cardNo) }
+                        mainHandler.post {
+                            if (!active.get()) return@post
+                            try {
+                                currentOnInsightCardNo(cardNo) { active.get() }
+                            } catch (error: Exception) {
+                                reportUiFailure(insightContext, "扫码回调失败，请重试", error)
+                            }
+                        }
                     }
                 }
             }
         )
-        cardNoExecutor.execute { insight.OnCardNo.run() }
+        cardNoExecutor.execute {
+            try {
+                if (active.get()) insight.OnCardNo.run()
+            } catch (error: Exception) {
+                // This is a plain executor thread, not a coroutine cancellation boundary.
+                if (active.get()) Log.e(APP_TAG, "UIKit card listener stopped unexpectedly", error)
+            }
+        }
 
         onDispose {
-            insight.Destroy()
-            cardNoExecutor.shutdownNow()
+            val needsDestroy = active.getAndSet(false)
+            releaseScannerResources(
+                { mainHandler.removeCallbacksAndMessages(null) },
+                { if (needsDestroy) insight.Destroy() },
+                { cardNoExecutor.shutdownNow() }
+            )
         }
     }
 
@@ -801,50 +998,79 @@ private fun UIKitInsightLayer(
         }
     }
 
-    AndroidView(
-        modifier = modifier,
-        factory = { viewContext ->
-            UIKitInsightHostView(viewContext).apply {
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-                renderUIKitInsight(insight, this, waitGroupLength)
+    val failureReason = displayFailureReason
+    if (failureReason != null) {
+        InsightFailureFallback(failureReason, currentOpenScanner)
+        return
+    }
+    key(insight) {
+        AndroidView(
+            modifier = modifier,
+            factory = { viewContext ->
+                UIKitInsightHostView(viewContext).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    // Mount in update so creation and subsequent data changes share one path.
+                }
+            },
+            update = { host ->
+                if (active.get()) {
+                    try {
+                        renderUIKitInsight(insight, host, waitGroupLength) { crashed ->
+                            if (active.getAndSet(false)) {
+                                displayFailureReason = if (crashed) {
+                                    "显示模块渲染进程崩溃，已切换到扫码页面"
+                                } else {
+                                    "显示模块渲染进程被终止，已切换到扫码页面"
+                                }
+                                releaseScannerResources({ insight.Destroy() })
+                            }
+                        }
+                    } catch (error: Exception) {
+                        Log.e(APP_TAG, "UIKit mount failed", error)
+                        if (active.getAndSet(false)) {
+                            // Keep arbitrary exception messages (URLs or business data) out of Toasts.
+                            displayFailureReason = "显示模块加载失败（${error.javaClass.simpleName}），已切换到扫码页面"
+                            releaseScannerResources({ insight.Destroy() })
+                        }
+                    }
+                }
             }
-        },
-        update = { host ->
-            renderUIKitInsight(insight, host, waitGroupLength)
+        )
+    }
+}
+
+/** Navigate once after composition, never inline from AndroidView.update or a renderer callback. */
+@Composable
+internal fun InsightFailureFallback(reason: String, onOpenScanner: () -> Unit) {
+    val appContext = LocalContext.current.applicationContext
+    val currentOpenScanner by rememberUpdatedState(onOpenScanner)
+    LaunchedEffect(Unit) {
+        try {
+            Toast.makeText(appContext, "非关键性bug:$reason", Toast.LENGTH_LONG).show()
+        } catch (error: Exception) {
+            Log.w(APP_TAG, "Unable to show UIKit fallback toast", error)
+        } finally {
+            // A failed Toast must not leave the operator on a broken display without a button.
+            currentOpenScanner()
         }
-    )
+    }
 }
 
 @Composable
 private fun ScannerPreviewCard(
     modifier: Modifier = Modifier,
     scannerGunMode: Boolean,
-    scanBlocked: Boolean,
+    scanGate: ScannerGate<String>,
     onBackToInsight: () -> Unit,
-    onScanned: suspend (String) -> Unit,
     onPencilClick: () -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    val scope = rememberCoroutineScope()
-    val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
-    val scanPlayer = remember { MediaPlayer.create(context, R.raw.tingko) }
     val scannerGunFocusRequester = remember { FocusRequester() }
     var scannerGunText by remember { mutableStateOf("") }
-    val scanGate = remember(context) {
-        ScannerGate<String>(context) { result ->
-            scope.launch {
-                onScanned(result)
-                scanFeedback(context, scanPlayer)
-            }
-        }
-    }
-    LaunchedEffect(scanBlocked) {
-        scanGate.setBlocked(scanBlocked)
-    }
     val scanLineTransition = rememberInfiniteTransition(label = "scan-line")
     val scanLineAlpha by scanLineTransition.animateFloat(
         initialValue = 0.28f,
@@ -867,33 +1093,199 @@ private fun ScannerPreviewCard(
     }
 
     LaunchedEffect(scannerGunMode) {
-        if (!scannerGunMode && !hasCameraPermission) permissionLauncher.launch(Manifest.permission.CAMERA)
+        try {
+            if (!scannerGunMode && !hasCameraPermission) permissionLauncher.launch(Manifest.permission.CAMERA)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            reportUiFailure(context, "相机权限申请失败", error)
+        }
     }
 
-    LaunchedEffect(scannerGunMode) {
-        if (scannerGunMode) {
+    val previewView = remember(context, scannerGunMode, hasCameraPermission) {
+        if (!scannerGunMode && hasCameraPermission) {
+            PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
+        } else null
+    }
+
+    DisposableEffect(previewView, lifecycleOwner, scannerGunMode, scanGate) {
+        val disposed = AtomicBoolean(false)
+        val failureReported = AtomicBoolean(false)
+        val errorHandler = Handler(Looper.getMainLooper())
+        var provider: ProcessCameraProvider? = null
+        var preview: Preview? = null
+        var analysis: ImageAnalysis? = null
+        var analyzer: MLKitBarcodeAnalyzer? = null
+        var executor: ExecutorService? = null
+
+        fun isActive(): Boolean = !disposed.get() &&
+            lifecycleOwner.lifecycle.currentState != Lifecycle.State.DESTROYED
+
+        fun releaseCamera() {
+            val ownedProvider = provider
+            val ownedPreview = preview
+            val ownedAnalysis = analysis
+            val ownedAnalyzer = analyzer
+            val ownedExecutor = executor
+            provider = null
+            preview = null
+            analysis = null
+            analyzer = null
+            executor = null
+            camera = null
             flashlightOn = false
-            if (camera == null) {
-                std.run().attachScannerGunApi(context) { code -> scanGate.submit(code) }
-                scannerGunFocusRequester.requestFocus()
-            } else {
-                camera = null
-                val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-                cameraProviderFuture.addListener(
+            releaseScannerResources(
+                { errorHandler.removeCallbacksAndMessages(null) },
+                { ownedAnalysis?.clearAnalyzer() },
+                {
+                    val useCases = listOfNotNull(ownedPreview, ownedAnalysis).toTypedArray()
+                    if (useCases.isNotEmpty()) ownedProvider?.unbind(*useCases)
+                },
+                { ownedPreview?.setSurfaceProvider(null) },
+                { ownedAnalyzer?.close() },
+                // Let already-queued analyze calls close their frames after the analyzer is closed.
+                { ownedExecutor?.shutdown() }
+            )
+        }
+
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_DESTROY) {
+                disposed.set(true)
+                releaseCamera()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(lifecycleObserver)
+        try {
+            if (previewView != null && !scannerGunMode && isActive()) {
+                val future = ProcessCameraProvider.getInstance(context)
+                future.addListener(
                     {
-                        runCatching {
-                            cameraProviderFuture.get().unbindAll()
-                        }.onFailure {
-                            Toast.makeText(context, "相机释放失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
+                        // Main executor serializes this listener with disposal/ON_DESTROY.
+                        // A late provider must not create resources or bind an old owner.
+                        if (isActive()) {
+                            try {
+                                val cameraProvider = future.get()
+                                provider = cameraProvider
+                                val ownedPreview = Preview.Builder().build()
+                                preview = ownedPreview
+                                ownedPreview.setSurfaceProvider(previewView.surfaceProvider)
+                                val ownedAnalysis = ImageAnalysis.Builder()
+                                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                                    .build()
+                                analysis = ownedAnalysis
+                                val ownedExecutor = Executors.newSingleThreadExecutor()
+                                executor = ownedExecutor
+                                val ownedAnalyzer = MLKitBarcodeAnalyzer(
+                                    onFailure = { error ->
+                                        if (isActive() && failureReported.compareAndSet(false, true)) {
+                                            errorHandler.post {
+                                                try {
+                                                    if (isActive()) scanGate.releaseAfterFailure(error)
+                                                } catch (cancelled: CancellationException) {
+                                                    throw cancelled
+                                                } catch (callbackError: Exception) {
+                                                    reportUiFailure(context, "扫码错误提示失败", callbackError)
+                                                }
+                                            }
+                                        }
+                                    },
+                                    onScanned = { result -> scanGate.submit(result, ::isActive) }
+                                )
+                                analyzer = ownedAnalyzer
+                                ownedAnalysis.setAnalyzer(ownedExecutor, ownedAnalyzer)
+                                if (isActive()) {
+                                    camera = cameraProvider.bindToLifecycle(
+                                        lifecycleOwner,
+                                        CameraSelector.DEFAULT_BACK_CAMERA,
+                                        ownedPreview,
+                                        ownedAnalysis
+                                    )
+                                } else {
+                                    releaseCamera()
+                                }
+                            } catch (cancelled: CancellationException) {
+                                releaseCamera()
+                                throw cancelled
+                            } catch (error: Exception) {
+                                releaseCamera()
+                                reportUiFailure(context, "相机启动失败，请重试", error)
+                            }
                         }
-                        std.run().attachScannerGunApi(context) { code -> scanGate.submit(code) }
-                        scannerGunFocusRequester.requestFocus()
                     },
                     ContextCompat.getMainExecutor(context)
                 )
             }
-        } else {
-            std.run().setScannerGunApiCallback(null)
+        } catch (cancelled: CancellationException) {
+            releaseCamera()
+            throw cancelled
+        } catch (error: Exception) {
+            releaseCamera()
+            reportUiFailure(context, "相机初始化失败，请重试", error)
+        }
+
+        onDispose {
+            disposed.set(true)
+            releaseScannerResources(
+                { lifecycleOwner.lifecycle.removeObserver(lifecycleObserver) },
+                { releaseCamera() }
+            )
+        }
+    }
+
+    DisposableEffect(context, lifecycleOwner, scannerGunMode, scanGate) {
+        val active = AtomicBoolean(scannerGunMode)
+        var detachCallback: (() -> Unit)? = null
+
+        fun detachScannerGun() {
+            val detach = detachCallback
+            detachCallback = null
+            detach?.invoke()
+        }
+
+        val lifecycleObserver = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_DESTROY) {
+                active.set(false)
+                releaseScannerResources({ detachScannerGun() })
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(lifecycleObserver)
+        try {
+            if (scannerGunMode && lifecycleOwner.lifecycle.currentState != Lifecycle.State.DESTROYED) {
+                val runtime = std.run()
+                detachCallback = { runtime.setScannerGunApiCallback(null) }
+                runtime.attachScannerGunApi(context) { code ->
+                    scanGate.submit(code) {
+                        active.get() && lifecycleOwner.lifecycle.currentState != Lifecycle.State.DESTROYED
+                    }
+                }
+            }
+        } catch (cancelled: CancellationException) {
+            active.set(false)
+            releaseScannerResources({ detachScannerGun() })
+            throw cancelled
+        } catch (error: Exception) {
+            active.set(false)
+            releaseScannerResources({ detachScannerGun() })
+            reportUiFailure(context, "扫码枪初始化失败，请重试", error)
+        }
+        onDispose {
+            active.set(false)
+            releaseScannerResources(
+                { lifecycleOwner.lifecycle.removeObserver(lifecycleObserver) },
+                { detachScannerGun() }
+            )
+        }
+    }
+
+    LaunchedEffect(scannerGunMode) {
+        if (scannerGunMode) {
+            try {
+                scannerGunFocusRequester.requestFocus()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                reportUiFailure(context, "扫码枪输入聚焦失败", error)
+            }
         }
     }
 
@@ -909,16 +1301,14 @@ private fun ScannerPreviewCard(
     }
 
     LaunchedEffect(flashlightOn, camera) {
-        val activeCamera = camera ?: return@LaunchedEffect
-        if (!activeCamera.cameraInfo.hasFlashUnit()) return@LaunchedEffect
-        activeCamera.cameraControl.enableTorch(flashlightOn)
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            scanGate.cancel()
-            cameraExecutor.shutdown()
-            scanPlayer.release()
+        try {
+            val activeCamera = camera ?: return@LaunchedEffect
+            if (!activeCamera.cameraInfo.hasFlashUnit()) return@LaunchedEffect
+            activeCamera.cameraControl.enableTorch(flashlightOn)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            reportUiFailure(context, "闪光灯控制失败", error)
         }
     }
 
@@ -929,50 +1319,13 @@ private fun ScannerPreviewCard(
         shape = RoundedCornerShape(0.dp)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            if (!scannerGunMode && hasCameraPermission) {
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { viewContext ->
-                        PreviewView(viewContext).apply {
-                            scaleType = PreviewView.ScaleType.FILL_CENTER
-                        }
-                    },
-                    update = { previewView ->
-                        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-                        cameraProviderFuture.addListener(
-                            {
-                                val cameraProvider = cameraProviderFuture.get()
-                                val preview = Preview.Builder().build().also {
-                                    it.setSurfaceProvider(previewView.surfaceProvider)
-                                }
-                                val imageAnalysis = ImageAnalysis.Builder()
-                                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                                    .build()
-                                    .also {
-                                        it.setAnalyzer(
-                                            cameraExecutor,
-                                            MLKitBarcodeAnalyzer { result ->
-                                                scanGate.submit(result)
-                                            }
-                                        )
-                                    }
-
-                                runCatching {
-                                    cameraProvider.unbindAll()
-                                    camera = cameraProvider.bindToLifecycle(
-                                        lifecycleOwner,
-                                        CameraSelector.DEFAULT_BACK_CAMERA,
-                                        preview,
-                                        imageAnalysis
-                                    )
-                                }.onFailure {
-                                    Toast.makeText(context, "相机启动失败：${it.message ?: "未知错误"}", Toast.LENGTH_LONG).show()
-                                }
-                            },
-                            ContextCompat.getMainExecutor(context)
-                        )
-                    }
-                )
+            if (previewView != null) {
+                key(previewView) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { previewView }
+                    )
+                }
             }
 
             Canvas(modifier = Modifier.fillMaxSize()) {
@@ -1388,7 +1741,8 @@ private fun BackendTargetDialog(
                 port = target.port,
                 insightPanelAddress = insightPanelAddress,
                 insightFirstRoute = insightFirstRoute,
-                insightSecondRoute = insightSecondRoute
+                insightSecondRoute = insightSecondRoute,
+                indexedBoundedMinWorkers = std.run().indexedBoundedMinWorkers
             ).toPrettyJson()
         )
     }
@@ -1415,6 +1769,7 @@ private fun BackendTargetDialog(
                 Text("insightPanelAddress：UIKit Insight 面板地址")
                 Text("insightRoutes.firstRoute：第一幕 WebProvider 签名 URL")
                 Text("insightRoutes.secondRoute：第二幕 iframe 签名 URL")
+                Text("runtimeSharedConfig.indexedBoundedMinWorkers：可选回填 Worker 下限；删除后仅按设备内存评估")
             }
         },
         confirmButton = {
