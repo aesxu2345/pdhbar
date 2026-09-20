@@ -1,0 +1,13 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Gradle: unit tests and debug APKs",
+			"type": "shell",
+			"command": "JAVA_HOME=\"/Applications/Android Studio.app/Contents/jbr/Contents/Home\" ./gradlew --no-configuration-cache -Dorg.gradle.java.home=\"/Applications/Android Studio.app/Contents/jbr/Contents/Home\" -Porg.gradle.java.installations.auto-detect=false -Porg.gradle.java.installations.paths=\"/Applications/Android Studio.app/Contents/jbr/Contents/Home\" :app:testDebugUnitTest --rerun assembleDebug assembleDebugAndroidTest --console=plain",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "test"
+		}
+	]
+}

@@ -1,6 +1,7 @@
 package com.pdyy.pdhbar.runtime
 
 import java.io.IOException
+import java.io.InputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Test
@@ -41,5 +42,24 @@ class BoundedHttpResponseTest {
         assertThrows(IOException::class.java) {
             readBoundedHttpResponse("HTTP/1.1 200 OK\r\nX-Test: ${"a".repeat(100)}".byteInputStream(), maxHeaderBytes = 32)
         }
+    }
+
+    @Test fun decodedBodyCountsUtf8BytesAndAcceptsExactLimit() {
+        assertEquals("早餐", readBoundedHttpBody("早餐".byteInputStream(), 6))
+        assertThrows(IOException::class.java) {
+            readBoundedHttpBody("早餐".byteInputStream(), 5)
+        }
+    }
+
+    @Test fun decodedBodyWithoutLengthStopsAfterOneOverflowByte() {
+        var bytesRead = 0
+        val input = object : InputStream() {
+            override fun read(): Int {
+                bytesRead++
+                return 'x'.code
+            }
+        }
+        assertThrows(IOException::class.java) { readBoundedHttpBody(input, 17) }
+        assertEquals(18, bytesRead)
     }
 }

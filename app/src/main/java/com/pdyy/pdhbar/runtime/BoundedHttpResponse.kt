@@ -5,13 +5,35 @@ import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
 
+internal const val MAX_HTTP_BODY_BYTES = 4 * 1024 * 1024
+internal const val MAX_HTTP_HEADER_BYTES = 64 * 1024
+
 internal data class HttpWireResponse(val statusCode: Int, val body: String)
+
+/** Count actual bytes, not characters or the (possibly absent/incorrect) Content-Length. */
+internal fun readBoundedHttpBody(
+    source: InputStream,
+    maxBodyBytes: Int = MAX_HTTP_BODY_BYTES
+): String {
+    require(maxBodyBytes > 0)
+    val body = ByteArrayOutputStream()
+    val scratch = ByteArray(8192)
+    while (true) {
+        // At the limit, only probe one extra byte; never allocate from a remote length.
+        val remaining = maxBodyBytes - body.size()
+        val count = source.read(scratch, 0, minOf(scratch.size.toLong(), remaining.toLong() + 1).toInt())
+        if (count < 0) break
+        if (count > remaining) throw IOException("HTTP body limit exceeded")
+        body.write(scratch, 0, count)
+    }
+    return body.toString(Charsets.UTF_8.name())
+}
 
 /** Parse framing in bytes, before UTF-8 decoding. Limits apply to every input path. */
 internal fun readBoundedHttpResponse(
     source: InputStream,
-    maxBodyBytes: Int = 4 * 1024 * 1024,
-    maxHeaderBytes: Int = 64 * 1024
+    maxBodyBytes: Int = MAX_HTTP_BODY_BYTES,
+    maxHeaderBytes: Int = MAX_HTTP_HEADER_BYTES
 ): HttpWireResponse {
     require(maxBodyBytes > 0 && maxHeaderBytes > 0)
     val input = source.buffered()
@@ -77,12 +99,7 @@ internal fun readBoundedHttpResponse(
             copyExactly(size)
         }
         else -> {
-            while (true) {
-                val read = input.read(scratch)
-                if (read < 0) break
-                if (read > maxBodyBytes - body.size()) throw IOException("HTTP body limit exceeded")
-                body.write(scratch, 0, read)
-            }
+            return HttpWireResponse(status, readBoundedHttpBody(input, maxBodyBytes))
         }
     }
     return HttpWireResponse(status, body.toString(Charsets.UTF_8.name()))

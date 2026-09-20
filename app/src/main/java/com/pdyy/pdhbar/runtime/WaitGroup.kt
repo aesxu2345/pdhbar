@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
@@ -187,6 +188,16 @@ class WaitGroupBuffer(
     private var attachedTarget: WaitGroup? = null
     private var outputForwarder: Job? = null
     private var lengthForwarder: Job? = null
+    private val persistRequests = Channel<Unit>(Channel.CONFLATED)
+
+    init {
+        // One IO consumer, not one coroutine per lifecycle notification while restore is blocked.
+        scope.launch {
+            for (request in persistRequests) {
+                withResolvedWaitGroup("persist", Unit) { it.persist() }
+            }
+        }
+    }
 
     override suspend fun push(
         orderCode: String,
@@ -194,8 +205,8 @@ class WaitGroupBuffer(
         approvalState: WaitApprovalState,
         cacheNode: BreakfastRightCacheNode?,
         ignoredSourceNodeId: String?
-    ): Boolean {
-        if (orderCode.isBlank()) return false
+    ): Boolean = withContext(Dispatchers.IO) {
+        if (orderCode.isBlank()) return@withContext false
         val active = resolveWaitGroup()
         val accepted = try {
             active.push(orderCode, action, approvalState, cacheNode, ignoredSourceNodeId)
@@ -207,11 +218,11 @@ class WaitGroupBuffer(
         }
         if (accepted) {
             length.value = active.len()
-            return true
+            return@withContext true
         }
 
         val replacement = replaceFailedWaitGroup(active)
-        return try {
+        try {
             replacement.push(
                 orderCode,
                 action,
@@ -230,10 +241,10 @@ class WaitGroupBuffer(
     }
 
     override suspend fun insertIgnoredOrder(orderCode: String): Boolean =
-        resolveWaitGroup().insertIgnoredOrder(orderCode)
+        withContext(Dispatchers.IO) { resolveWaitGroup().insertIgnoredOrder(orderCode) }
 
     override suspend fun insertIgnoredOrders(orderCodes: List<String>): Int =
-        resolveWaitGroup().insertIgnoredOrders(orderCodes)
+        withContext(Dispatchers.IO) { resolveWaitGroup().insertIgnoredOrders(orderCodes) }
 
     override suspend fun findIgnoredOrder(orderCode: String): IgnoredOrderSnapshot? {
         val active = delegate ?: return null
@@ -243,16 +254,18 @@ class WaitGroupBuffer(
     }
 
     override suspend fun ignoredOrderSnapshots(): List<IgnoredOrderSnapshot> =
-        resolveWaitGroup().ignoredOrderSnapshots()
+        withContext(Dispatchers.IO) { resolveWaitGroup().ignoredOrderSnapshots() }
 
     override suspend fun ignoredOrdersMissingCache(): List<IgnoredCacheNodeRef> =
-        resolveWaitGroup().ignoredOrdersMissingCache()
+        withContext(Dispatchers.IO) { resolveWaitGroup().ignoredOrdersMissingCache() }
 
     override suspend fun overwriteIgnoredCache(
         nodeId: String,
         orderCode: String,
         cacheNode: BreakfastRightCacheNode
-    ): Boolean = resolveWaitGroup().overwriteIgnoredCache(nodeId, orderCode, cacheNode)
+    ): Boolean = withContext(Dispatchers.IO) {
+        resolveWaitGroup().overwriteIgnoredCache(nodeId, orderCode, cacheNode)
+    }
 
     override fun len(): Int = length.value
 
@@ -264,11 +277,13 @@ class WaitGroupBuffer(
     }
 
     override fun ageUnregistered(force: Boolean) {
-        withResolvedWaitGroup("ageUnregistered", Unit) { it.ageUnregistered(force) }
+        scope.launch {
+            withResolvedWaitGroup("ageUnregistered", Unit) { it.ageUnregistered(force) }
+        }
     }
 
     override fun persist() {
-        withResolvedWaitGroup("persist", Unit) { it.persist() }
+        persistRequests.trySend(Unit)
     }
 
     private fun createWaitGroup(): WaitGroup = WaitGroup(
@@ -1064,7 +1079,45 @@ class WaitGroup(
     }
 
     private fun removeExpiredIgnoredCaches(nowEpochMs: Long) {
-        nodes().filter { isExpiredIgnoredCache(it, nowEpochMs) }.forEach(::unlink)
+        var node = current ?: return
+        var firstRetained: Node? = null
+        var lastRetained: Node? = null
+        val retainedOrders = HashSet<String>()
+        val removedIndexes = LinkedHashMap<String, Long>()
+        // Visit the original ring once, preserving its cursor/order and revision per removal.
+        // Repeated unlink() used to search both the predecessor and surviving orders per node.
+        repeat(size) {
+            val next = checkNotNull(node.next)
+            if (isExpiredIgnoredCache(node, nowEpochMs)) {
+                size -= 1
+                revision += 1
+                ignoredReadIndex.remove(node.request.orderCode, node.id, node.cacheIndex)
+                // For duplicate restored orders, keep the last removed generation in ring order.
+                removedIndexes[node.request.orderCode] = node.cacheIndex
+            } else {
+                if (firstRetained == null) firstRetained = node else lastRetained?.next = node
+                lastRetained = node
+                if (node.approvalState == WaitApprovalState.Ignored) {
+                    retainedOrders.add(node.request.orderCode)
+                }
+            }
+            node = next
+        }
+        lastRetained?.next = firstRetained
+        current = firstRetained
+        if (removedIndexes.isEmpty()) return
+        length.value = size
+
+        // Keep the existing surviving-node and disk-generation guards, but commit once per batch.
+        var editor: android.content.SharedPreferences.Editor? = null
+        removedIndexes.forEach { (orderCode, cacheIndex) ->
+            if (orderCode in retainedOrders) return@forEach
+            val cached = readCacheIndex(orderCode)
+            if (cached != null && cached.cacheIndex != cacheIndex) return@forEach
+            val batch = editor ?: cacheIndexPreferences.edit().also { editor = it }
+            batch.remove(orderCode)
+        }
+        editor?.commit()
     }
 
     private fun unlinkExpiredIgnoredCache(target: Node, nowEpochMs: Long): Boolean {

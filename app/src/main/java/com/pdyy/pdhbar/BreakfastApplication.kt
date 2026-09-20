@@ -15,6 +15,14 @@ import java.util.concurrent.Executors
 class BreakfastApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        // Gecko services run this Application too. Only the main process owns shared diagnostics.
+        val processName = if (Build.VERSION.SDK_INT >= 28) {
+            getProcessName()
+        } else {
+            getSystemService(ActivityManager::class.java)?.runningAppProcesses
+                ?.firstOrNull { it.pid == Process.myPid() }?.processName
+        }
+        if (processName != packageName) return
         val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             try {

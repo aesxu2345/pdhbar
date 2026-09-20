@@ -147,7 +147,7 @@ private const val InsightPanelAddressKey = "insight_panel_address"
 private const val DefaultInsightPanelAddress = "172.16.203.56"
 private const val InsightFirstRouteKey = "insight_first_route"
 private const val InsightSecondRouteKey = "insight_second_route"
-private const val DefaultInsightRoute = "http://129.153.98.122:8080/ZbXiOJvl_u0yYmWK/BKheVq-FzHT3oXfIozIanpfrXFG9wJB7ts9WNw8Snvn5XoSj8Fi08ju1YfaH8fk1Zeuug9QKq5u7YbACoxHpV7KCiOPoDREU1MhXj_5bbHUX54-dDiyEaKFULdhQ8wMAaaASUfkQ3GdmKyHtOTUc6Nkv9gXXuYI3asu6NmtYdJ_O5hKypr9QV8Cmcaycud4voUdeszcJrHM6ViDFCGi5uFaFX4xfQ-GaxKzyvBz9qUIooQ_lAw9Zy7A8wW7NPpQ5c3aB9Ewc7WFPWcHj79NgeQv73bslsat1DhAtirGjXcMIfvTv8fjED6oWdmm95T9pq_TWa8wpz8BZH8dVK-bJOQ"
+private const val DefaultInsightRoute = "http://172.16.18.167:18082/ZbXiOJvl_u0yYmWK/BKheVq-FzHT3oXfIozIanpfrXFG9wJB7ts9WNw8Snvn5XoSj8Fi08ju1YfaH8fk1Zeuug9QKq5u7YbACoxHpV7KCiOPoDREU1MhXj_5bbHUX54-dDiyEaKFULdhQ8wMAaaASUfkQ3GdmKyHtOTUc6Nkv9gXXuYI3asu6NmtYdJ_O5hKypr9QV8Cmcaycud4voUdeszcJrHM6ViDFCGi5uFaFX4xfQ-GaxKzyvBz9qUIooQ_lAw9Zy7A8wW7NPpQ5c3aB9Ewc7WFPWcHj79NgeQv73bslsat1DhAtirGjXcMIfvTv8fjED6oWdmm95T9pq_TWa8wpz8BZH8dVK-bJOQ"
 private const val DefaultInsightFirstRoute = "$DefaultInsightRoute/provider"
 
 private fun defaultInsightFirstRoute(): String = DefaultInsightFirstRoute
@@ -199,6 +199,16 @@ private fun applyUIKitWaitGroupCorrection(
 
 private class UIKitInsightHostView(context: Context) : FrameLayout(context) {
     val mountState = InsightMountState()
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        HostBrowserDebug.event(this, "container.attached", this, "children=$childCount")
+    }
+
+    override fun onDetachedFromWindow() {
+        HostBrowserDebug.event(this, "container.detached", this, "children=$childCount", stack = true)
+        super.onDetachedFromWindow()
+    }
 }
 
 private fun renderUIKitInsight(
@@ -211,25 +221,35 @@ private fun renderUIKitInsight(
         insight,
         waitGroupLength,
         mount = {
+            HostBrowserDebug.event(insight, "mount.begin", host, "children=${host.childCount}", stack = true)
             host.removeAllViews()
             val browser = insight.Display(host.context, host)
-            // The bundled AAR installs only a plain WebViewClient (verified in its bytecode).
+            HostBrowserDebug.event(insight, "mount.display.returned", browser)
+            // Route renderer failures through the host's whole-instance recovery.
             browser.webViewClient = object : WebViewClient() {
                 override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                    HostBrowserDebug.event(insight, "renderer.gone", view,
+                        "crashed=${detail.didCrash()} priority=${detail.rendererPriorityAtExit()}")
                     Log.e(APP_TAG, "UIKit renderer gone: crashed=${detail.didCrash()}, priority=${detail.rendererPriorityAtExit()}")
                     // Detach first: the new AAR cleans up the dead renderer but only offers
-                    // recovery/recreation when it still has a parent. Keep our scanner fallback.
-                    (view.parent as? ViewGroup)?.removeView(view)
+                    // recovery/recreation when it still has a parent. Avoid two recovery owners.
                     try {
+                        HostBrowserDebug.event(insight, "renderer.detach.for.host.recovery", view)
+                        (view.parent as? ViewGroup)?.removeView(view)
                         insight.onRenderProcessGone(view, detail)
+                        HostBrowserDebug.event(insight, "renderer.sdk.cleanup.returned", view)
                     } catch (error: Exception) {
+                        HostBrowserDebug.event(insight, "renderer.cleanup.failed", detail = "type=${error.javaClass.simpleName}")
                         Log.e(APP_TAG, "UIKit renderer cleanup failed", error)
                     } finally {
+                        HostBrowserDebug.event(insight, "renderer.host.fallback.begin")
                         onRendererGone(detail.didCrash())
+                        HostBrowserDebug.event(insight, "renderer.host.fallback.returned")
                     }
                     return true
                 }
             }
+            HostBrowserDebug.event(insight, "mount.complete", browser)
         },
         correct = { applyUIKitWaitGroupCorrection(insight, it) }
     )
@@ -374,33 +394,53 @@ private class ScannerGate<T>(
     private val lockedAt = AtomicLong(0L)
     private val cancelled = AtomicBoolean(false)
 
-    fun submit(value: T, isActive: () -> Boolean = { true }) {
+    fun submit(value: T, trace: ((String) -> Unit)? = null, isActive: () -> Boolean = { true }) {
         // The first decoded result owns the gate immediately. Do not wait for the
         // query coroutine or customer dialog to update Compose state. A stale lock
         // can be atomically replaced after seven seconds, so it cannot deadlock.
         try {
-            if (cancelled.get() || !isActive() || !tryAcquire()) return
+            if (cancelled.get()) {
+                trace?.invoke("gate.reject.cancelled")
+                return
+            }
+            if (!isActive()) {
+                trace?.invoke("gate.reject.inactive")
+                return
+            }
+            if (!tryAcquire()) {
+                trace?.invoke("gate.reject.locked")
+                return
+            }
+            trace?.invoke("gate.acquired")
             val acquiredAt = lockedAt.get()
             val posted = handler.post {
                 try {
                     if (cancelled.get() || !isActive()) {
+                        trace?.invoke("gate.reject.retired_before_dispatch")
                         lockedAt.compareAndSet(acquiredAt, 0L)
                         return@post
                     }
                     if (!appContext.isWifiConnected()) {
+                        trace?.invoke("gate.reject.wifi_disconnected")
                         lockedAt.compareAndSet(acquiredAt, 0L)
                         Toast.makeText(appContext, "WiFi未连接", Toast.LENGTH_SHORT).show()
                         return@post
                     }
+                    trace?.invoke("gate.dispatch")
                     action(value, this)
                 } catch (cancelled: CancellationException) {
+                    trace?.invoke("gate.dispatch.cancelled")
                     lockedAt.compareAndSet(acquiredAt, 0L)
                     throw cancelled
                 } catch (error: Exception) {
+                    trace?.invoke("gate.dispatch.failed")
                     releaseAfterFailure(error)
                 }
             }
-            if (!posted) lockedAt.compareAndSet(acquiredAt, 0L)
+            if (!posted) {
+                trace?.invoke("gate.post.rejected")
+                lockedAt.compareAndSet(acquiredAt, 0L)
+            }
         } catch (cancelled: CancellationException) {
             lockedAt.set(0L)
             throw cancelled
@@ -730,6 +770,8 @@ fun BreakfastApp() {
         ScannerPreviewCard(
             modifier = Modifier.fillMaxSize(),
             scannerGunMode = scannerGunMode,
+            cameraRequested = !uiLayerVisible && customer == null && !manualInputOpen &&
+                !submittingBreakfast && queuedBreakfast == null,
             scanGate = scannerGate,
             onBackToInsight = { uiLayerVisible = true },
             onPencilClick = {
@@ -737,33 +779,40 @@ fun BreakfastApp() {
                 manualInputOpen = true
             }
         )
-        if (uiLayerVisible) {
-            UIKitInsightLayer(
-                modifier = Modifier.fillMaxSize(),
-                onManualInputClick = {
-                    uiLayerVisible = false
-                    manualInputOpen = true
-                },
-                onBackendTargetClick = { backendDialogOpen = true },
-                onCameraInfraredSwitch = {
-                    val enabled = !scannerGunMode
-                    scannerGunMode = enabled
-                    std.run().setScannerGunMode(enabled)
-                    std.save(context.applicationContext)
-                    Log.d(APP_TAG, "scanner gun mode saved=$enabled, waiting app exit before hardware switch")
-                    exitConfirmOpen = true
-                },
-                onLicenseClick = { licenseDialogOpen = true },
-                onOpenScanner = { uiLayerVisible = false },
-                insightPanelAddress = insightPanelAddress,
-                insightFirstRoute = insightFirstRoute,
-                insightSecondRoute = insightSecondRoute,
-                onInsightCardNo = { cardNo, isActive ->
-                    if (customer == null && !submittingBreakfast && queuedBreakfast == null) {
-                        scannerGate.submit(cardNo, isActive)
+        InsightRecoveryHost(
+            visible = uiLayerVisible,
+            onReopen = { uiLayerVisible = true }
+        ) { restartInsight ->
+                UIKitInsightLayer(
+                    modifier = Modifier.fillMaxSize(),
+                    onManualInputClick = {
+                        uiLayerVisible = false
+                        manualInputOpen = true
+                    },
+                    onBackendTargetClick = { backendDialogOpen = true },
+                    onCameraInfraredSwitch = {
+                        val enabled = !scannerGunMode
+                        scannerGunMode = enabled
+                        std.run().setScannerGunMode(enabled)
+                        std.save(context.applicationContext)
+                        Log.d(APP_TAG, "scanner gun mode saved=$enabled, waiting app exit before hardware switch")
+                        exitConfirmOpen = true
+                    },
+                    onLicenseClick = { licenseDialogOpen = true },
+                    onOpenScanner = { uiLayerVisible = false },
+                    onRestartInsight = restartInsight,
+                    insightPanelAddress = insightPanelAddress,
+                    insightFirstRoute = insightFirstRoute,
+                    insightSecondRoute = insightSecondRoute,
+                    onInsightCardNo = { cardNo, isActive, trace ->
+                        when {
+                            customer != null -> trace("ui.reject.customer_dialog")
+                            submittingBreakfast -> trace("ui.reject.submitting")
+                            queuedBreakfast != null -> trace("ui.reject.queued_confirmation")
+                            else -> scannerGate.submit(cardNo, trace = trace, isActive = isActive)
+                        }
                     }
-                }
-            )
+                )
         }
         if (submittingBreakfast || queuedBreakfast != null) {
             BackHandler(enabled = true) {}
@@ -884,6 +933,104 @@ fun BreakfastApp() {
 }
 
 @Composable
+internal fun InsightRecoveryHost(
+    visible: Boolean = true,
+    onReopen: () -> Unit = {},
+    content: @Composable (onRestart: () -> Unit) -> Unit
+) {
+    var recovery by remember { mutableStateOf(InsightRecoveryState()) }
+    var pendingGeneration by remember { mutableStateOf<Long?>(null) }
+    val currentReopen by rememberUpdatedState(onReopen)
+    DisposableEffect(Unit) {
+        HostBrowserDebug.event(null, "recovery.host.enter")
+        onDispose { HostBrowserDebug.event(null, "recovery.host.dispose", stack = true) }
+    }
+    LaunchedEffect(visible, recovery.generation, recovery.paused, pendingGeneration) {
+        HostBrowserDebug.event(null, "recovery.host.state", detail =
+            "visible=$visible generation=${recovery.generation} paused=${recovery.paused} pending=$pendingGeneration")
+    }
+    // Owned by the screen, not the failing UIKit subtree: navigation cannot cancel recovery.
+    LaunchedEffect(pendingGeneration) {
+        val failedGeneration = pendingGeneration ?: return@LaunchedEffect
+        HostBrowserDebug.event(null, "recovery.scheduled", detail = "generation=$failedGeneration delayMs=1000")
+        Log.i(APP_TAG, "UIKit recovery scheduled generation=$failedGeneration")
+        try {
+            delay(1_000L)
+        } catch (cancelled: CancellationException) {
+            HostBrowserDebug.event(null, "recovery.cancelled", detail = "generation=$failedGeneration")
+            throw cancelled
+        }
+        recovery = recovery.restartAutomatically(failedGeneration, SystemClock.elapsedRealtime())
+        pendingGeneration = null
+        currentReopen()
+        HostBrowserDebug.event(null, "recovery.reopen", detail = "generation=${recovery.generation} paused=${recovery.paused}")
+        Log.i(APP_TAG, "UIKit recovery reopen generation=${recovery.generation} paused=${recovery.paused}")
+    }
+    if (pendingGeneration != null) {
+        // Unmount/close the failed generation before creating its replacement.
+        Text("正在重新打开UIKit…", color = Color.White)
+        return
+    }
+    if (!visible) return
+    val currentGeneration = recovery.generation
+    if (recovery.paused) {
+        Box(
+            modifier = Modifier.fillMaxSize().background(Color(0xFF050806)),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
+                Text("UIKit连续恢复失败，已暂停自动重开", color = Color.White)
+                Text("请释放内存或检查显示组件后重试", color = Color.White)
+                Button(onClick = { recovery = recovery.restartManually(currentGeneration) }) {
+                    Text("重新打开UIKit")
+                }
+            }
+        }
+        return
+    }
+    key(currentGeneration) {
+        content {
+            HostBrowserDebug.event(null, "recovery.request", detail =
+                "requested=$currentGeneration current=${recovery.generation} paused=${recovery.paused} pending=$pendingGeneration")
+            if (currentGeneration == recovery.generation && !recovery.paused && pendingGeneration == null) {
+                pendingGeneration = currentGeneration
+            }
+        }
+    }
+}
+
+/** Owns one generation. Stop callbacks immediately, then destroy UIKit before interrupting its listener. */
+private class UIKitInsightSession(val insight: NewUIInsightPlay, val active: AtomicBoolean) {
+    val mainHandler = Handler(Looper.getMainLooper())
+    val cardNoExecutor = Executors.newSingleThreadExecutor()
+    private var released = false
+
+    // Only fixed stage names and instance identity: never card numbers, URLs or exception messages.
+    fun traceCardFlow(stage: String) {
+        Log.i("BreakfastCardFlow", "session=${System.identityHashCode(insight)} stage=$stage active=${active.get()}")
+    }
+
+    fun close() {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        HostBrowserDebug.event(insight, "session.close.begin", detail = "released=$released active=${active.get()}", stack = true)
+        active.set(false)
+        if (released) return
+        released = true
+        traceCardFlow("session.close")
+        releaseScannerResources(
+            { mainHandler.removeCallbacksAndMessages(null) },
+            { insight.Destroy() },
+            { cardNoExecutor.shutdownNow() }
+        )
+        HostBrowserDebug.event(insight, "session.close.end")
+    }
+}
+
+@Composable
 private fun UIKitInsightLayer(
     modifier: Modifier = Modifier,
     onManualInputClick: () -> Unit,
@@ -891,102 +1038,156 @@ private fun UIKitInsightLayer(
     onCameraInfraredSwitch: () -> Unit,
     onLicenseClick: () -> Unit,
     onOpenScanner: () -> Unit,
+    onRestartInsight: () -> Unit,
     insightPanelAddress: String,
     insightFirstRoute: String,
     insightSecondRoute: String,
-    onInsightCardNo: (String, () -> Boolean) -> Unit
+    onInsightCardNo: (String, () -> Boolean, (String) -> Unit) -> Unit
 ) {
     val insightContext = LocalContext.current
-    val mainHandler = remember { Handler(Looper.getMainLooper()) }
+    val active = remember(insightPanelAddress, insightFirstRoute, insightSecondRoute) { AtomicBoolean(true) }
     val currentOnInsightCardNo by rememberUpdatedState(onInsightCardNo)
     val currentManualInput by rememberUpdatedState(onManualInputClick)
     val currentBackendTarget by rememberUpdatedState(onBackendTargetClick)
     val currentCameraSwitch by rememberUpdatedState(onCameraInfraredSwitch)
     val currentLicense by rememberUpdatedState(onLicenseClick)
     val currentOpenScanner by rememberUpdatedState(onOpenScanner)
-    val eventHandler = remember {
+    val eventHandler = remember(active) {
         object : UIEventStruct() {
             override fun onManualBarcodeInput() {
-                currentManualInput()
+                HostBrowserDebug.event(active, "ui.manual.input", detail = "active=${active.get()}")
+                if (active.get()) currentManualInput()
             }
 
             override fun onConfigureBackendAddress() {
-                currentBackendTarget()
+                if (active.get()) currentBackendTarget()
             }
 
             override fun onCameraInfraredSwitch() {
-                currentCameraSwitch()
+                if (active.get()) currentCameraSwitch()
             }
 
             override fun onOpenSourceLicenses() {
-                currentLicense()
+                if (active.get()) currentLicense()
             }
 
             override fun onScanRegistration() {
-                currentOpenScanner()
+                HostBrowserDebug.event(active, "ui.scan.registration", detail = "active=${active.get()}")
+                if (active.get()) currentOpenScanner()
             }
 
             override fun onSettings() {
-                currentBackendTarget()
+                if (active.get()) currentBackendTarget()
             }
 
             override fun onOpenScanner() {
-                currentOpenScanner()
+                HostBrowserDebug.event(active, "ui.open.scanner", detail = "active=${active.get()}")
+                if (active.get()) currentOpenScanner()
             }
         }
     }
 
-    val insight = remember(eventHandler, insightPanelAddress, insightFirstRoute, insightSecondRoute) {
-        createUIKitInsight(
-            BreakfastInsightConfig(insightPanelAddress, insightFirstRoute, insightSecondRoute),
-            UIInsightCss(
-                "uikit_insight/index.html",
-                18f,
-                156f,
-                88f,
-                "#f7faf7",
-                "#18813b"
+    val creation = remember(eventHandler, insightPanelAddress, insightFirstRoute, insightSecondRoute) {
+        try {
+            val insight = createUIKitInsight(
+                BreakfastInsightConfig(insightPanelAddress, insightFirstRoute, insightSecondRoute),
+                UIInsightCss(
+                    "uikit_insight/index.html",
+                    18f,
+                    156f,
+                    88f,
+                    "#f7faf7",
+                    "#18813b"
+                )
             )
-        ).also { it.OnClickUIEvent(eventHandler) }
+            HostBrowserDebug.event(insight, "session.created", detail = "active=${HostBrowserDebug.id(active)}")
+            Result.success(UIKitInsightSession(insight, active))
+        } catch (error: Exception) {
+            active.set(false)
+            HostBrowserDebug.event(active, "session.creation.failed", detail = "type=${error.javaClass.simpleName}")
+            Log.e(APP_TAG, "UIKit initialization failed", error)
+            Result.failure<UIKitInsightSession>(error)
+        }
+    }
+    val session = creation.getOrNull()
+    if (session == null) {
+        InsightFailureFallback(
+            "显示模块初始化失败（${creation.exceptionOrNull()?.javaClass?.simpleName}）",
+            onRestartInsight
+        )
+        return
     }
 
-    val active = remember(insight) { AtomicBoolean(true) }
-    var displayFailureReason by remember(insight) { mutableStateOf<String?>(null) }
-    DisposableEffect(insight) {
-        val cardNoExecutor = Executors.newSingleThreadExecutor()
-        insight.OnCardNo.enroll(
-            object : OnCardNo() {
-                override fun event(str: String) {
-                    if (!active.get()) return
-                    str.takeIf(String::isNotBlank)?.let { cardNo ->
-                        mainHandler.post {
-                            if (!active.get()) return@post
-                            try {
-                                currentOnInsightCardNo(cardNo) { active.get() }
-                            } catch (error: Exception) {
-                                reportUiFailure(insightContext, "扫码回调失败，请重试", error)
+    val insight = session.insight
+    var displayFailureReason by remember(session) { mutableStateOf<String?>(null) }
+    fun fail(reason: String) {
+        HostBrowserDebug.event(insight, "layer.failure", detail = "active=${active.get()} reason=$reason")
+        if (active.getAndSet(false)) {
+            displayFailureReason = reason
+            session.close()
+        }
+    }
+    DisposableEffect(session) {
+        HostBrowserDebug.event(insight, "layer.effect.enter", detail = "active=${active.get()}")
+        // AndroidView can fail before this effect starts. Never register work on a retired instance.
+        if (active.get()) {
+            try {
+                session.traceCardFlow("listener.register.begin")
+                insight.OnClickUIEvent(eventHandler)
+                insight.OnCardNo.enroll(
+                    object : OnCardNo() {
+                        override fun event(str: String) {
+                            session.traceCardFlow("callback.received")
+                            if (!active.get()) {
+                                session.traceCardFlow("callback.reject.inactive")
+                                return
                             }
+                            if (str.isBlank()) {
+                                session.traceCardFlow("callback.reject.blank")
+                                return
+                            }
+                            val posted = session.mainHandler.post {
+                                if (!active.get()) {
+                                    session.traceCardFlow("callback.reject.retired_before_main")
+                                    return@post
+                                }
+                                session.traceCardFlow("callback.main")
+                                try {
+                                    currentOnInsightCardNo(str, { active.get() }, session::traceCardFlow)
+                                } catch (error: Exception) {
+                                    session.traceCardFlow("callback.failed")
+                                    reportUiFailure(insightContext, "扫码回调失败，请重试", error)
+                                }
+                            }
+                            if (!posted) session.traceCardFlow("callback.post.rejected")
                         }
                     }
+                )
+                session.traceCardFlow("listener.register.done")
+                session.cardNoExecutor.execute {
+                    try {
+                        session.traceCardFlow("listener.run.enter")
+                        if (active.get()) insight.OnCardNo.run()
+                    } catch (error: Exception) {
+                        session.traceCardFlow("listener.run.failed")
+                        // A plain executor thread, not a coroutine cancellation boundary.
+                        if (active.get()) {
+                            Log.e(APP_TAG, "UIKit card listener stopped unexpectedly", error)
+                            session.mainHandler.post { fail("显示模块监听失败") }
+                        }
+                    } finally {
+                        session.traceCardFlow("listener.run.exit")
+                    }
                 }
-            }
-        )
-        cardNoExecutor.execute {
-            try {
-                if (active.get()) insight.OnCardNo.run()
             } catch (error: Exception) {
-                // This is a plain executor thread, not a coroutine cancellation boundary.
-                if (active.get()) Log.e(APP_TAG, "UIKit card listener stopped unexpectedly", error)
+                session.traceCardFlow("listener.register.failed")
+                Log.e(APP_TAG, "UIKit listener registration failed", error)
+                fail("显示模块监听初始化失败（${error.javaClass.simpleName}）")
             }
         }
-
         onDispose {
-            val needsDestroy = active.getAndSet(false)
-            releaseScannerResources(
-                { mainHandler.removeCallbacksAndMessages(null) },
-                { if (needsDestroy) insight.Destroy() },
-                { cardNoExecutor.shutdownNow() }
-            )
+            HostBrowserDebug.event(insight, "layer.effect.dispose", stack = true)
+            session.close()
         }
     }
 
@@ -1000,7 +1201,7 @@ private fun UIKitInsightLayer(
 
     val failureReason = displayFailureReason
     if (failureReason != null) {
-        InsightFailureFallback(failureReason, currentOpenScanner)
+        InsightFailureFallback(failureReason, onRestartInsight)
         return
     }
     key(insight) {
@@ -1019,22 +1220,19 @@ private fun UIKitInsightLayer(
                 if (active.get()) {
                     try {
                         renderUIKitInsight(insight, host, waitGroupLength) { crashed ->
-                            if (active.getAndSet(false)) {
-                                displayFailureReason = if (crashed) {
-                                    "显示模块渲染进程崩溃，已切换到扫码页面"
+                            fail(
+                                if (crashed) {
+                                    "显示模块渲染进程崩溃"
                                 } else {
-                                    "显示模块渲染进程被终止，已切换到扫码页面"
+                                    "显示模块渲染进程被终止"
                                 }
-                                releaseScannerResources({ insight.Destroy() })
-                            }
+                            )
                         }
                     } catch (error: Exception) {
+                        HostBrowserDebug.event(insight, "mount.failed", host, "type=${error.javaClass.simpleName}")
                         Log.e(APP_TAG, "UIKit mount failed", error)
-                        if (active.getAndSet(false)) {
-                            // Keep arbitrary exception messages (URLs or business data) out of Toasts.
-                            displayFailureReason = "显示模块加载失败（${error.javaClass.simpleName}），已切换到扫码页面"
-                            releaseScannerResources({ insight.Destroy() })
-                        }
+                        // Keep arbitrary exception messages (URLs or business data) out of Toasts.
+                        fail("显示模块加载失败（${error.javaClass.simpleName}）")
                     }
                 }
             }
@@ -1042,20 +1240,26 @@ private fun UIKitInsightLayer(
     }
 }
 
-/** Navigate once after composition, never inline from AndroidView.update or a renderer callback. */
+/** Restart once after composition, never inline from AndroidView.update or a renderer callback. */
 @Composable
-internal fun InsightFailureFallback(reason: String, onOpenScanner: () -> Unit) {
+internal fun InsightFailureFallback(reason: String, onRestartInsight: () -> Unit) {
     val appContext = LocalContext.current.applicationContext
-    val currentOpenScanner by rememberUpdatedState(onOpenScanner)
+    val currentRestartInsight by rememberUpdatedState(onRestartInsight)
+    Box(
+        modifier = Modifier.fillMaxSize().background(Color(0xFF050806)),
+        contentAlignment = Alignment.Center
+    ) {
+        Text("正在重新打开UIKit…", color = Color.White)
+    }
     LaunchedEffect(Unit) {
         try {
             Toast.makeText(appContext, "非关键性bug:$reason", Toast.LENGTH_LONG).show()
         } catch (error: Exception) {
             Log.w(APP_TAG, "Unable to show UIKit fallback toast", error)
-        } finally {
-            // A failed Toast must not leave the operator on a broken display without a button.
-            currentOpenScanner()
         }
+        // Hand recovery to the screen immediately, before this failing subtree can disappear.
+        // The host owns throttling, disposal, generation replacement and returning to UIKit.
+        currentRestartInsight()
     }
 }
 
@@ -1063,24 +1267,41 @@ internal fun InsightFailureFallback(reason: String, onOpenScanner: () -> Unit) {
 private fun ScannerPreviewCard(
     modifier: Modifier = Modifier,
     scannerGunMode: Boolean,
+    cameraRequested: Boolean,
     scanGate: ScannerGate<String>,
     onBackToInsight: () -> Unit,
     onPencilClick: () -> Unit
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    var foreground by remember(lifecycleOwner) {
+        mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+    }
+    // A new token also recreates resources when pause/resume happens before the next frame.
+    var resumeGeneration by remember(lifecycleOwner) { mutableStateOf(0L) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            foreground = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+            if (event == Lifecycle.Event.ON_RESUME) resumeGeneration++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+    val cameraActive = cameraRequested && foreground && !scannerGunMode
     val scannerGunFocusRequester = remember { FocusRequester() }
     var scannerGunText by remember { mutableStateOf("") }
-    val scanLineTransition = rememberInfiniteTransition(label = "scan-line")
-    val scanLineAlpha by scanLineTransition.animateFloat(
-        initialValue = 0.28f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 780),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "scan-line-alpha"
-    )
+    // Read the animated state only inside Canvas: no per-frame recomposition of camera/SDK UI.
+    val scanLineAlpha = if (cameraActive) {
+        rememberInfiniteTransition(label = "scan-line").animateFloat(
+            initialValue = 0.28f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 780),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "scan-line-alpha"
+        )
+    } else remember { mutableStateOf(1f) }
     var hasCameraPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
@@ -1092,9 +1313,11 @@ private fun ScannerPreviewCard(
         hasCameraPermission = granted
     }
 
-    LaunchedEffect(scannerGunMode) {
+    // A permission dialog itself pauses/resumes the Activity. Do not request again on resume
+    // after a denial; only a fresh entry into the camera screen may ask again.
+    LaunchedEffect(cameraRequested, scannerGunMode) {
         try {
-            if (!scannerGunMode && !hasCameraPermission) permissionLauncher.launch(Manifest.permission.CAMERA)
+            if (cameraRequested && !scannerGunMode && !hasCameraPermission) permissionLauncher.launch(Manifest.permission.CAMERA)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
@@ -1102,8 +1325,8 @@ private fun ScannerPreviewCard(
         }
     }
 
-    val previewView = remember(context, scannerGunMode, hasCameraPermission) {
-        if (!scannerGunMode && hasCameraPermission) {
+    val previewView = remember(context, cameraActive, hasCameraPermission, resumeGeneration) {
+        if (cameraActive && hasCameraPermission) {
             PreviewView(context).apply { scaleType = PreviewView.ScaleType.FILL_CENTER }
         } else null
     }
@@ -1118,8 +1341,8 @@ private fun ScannerPreviewCard(
         var analyzer: MLKitBarcodeAnalyzer? = null
         var executor: ExecutorService? = null
 
-        fun isActive(): Boolean = !disposed.get() &&
-            lifecycleOwner.lifecycle.currentState != Lifecycle.State.DESTROYED
+        fun isActive(): Boolean = !disposed.get() && cameraActive &&
+            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
 
         fun releaseCamera() {
             val ownedProvider = provider
@@ -1149,7 +1372,7 @@ private fun ScannerPreviewCard(
         }
 
         val lifecycleObserver = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_DESTROY) {
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_DESTROY) {
                 disposed.set(true)
                 releaseCamera()
             }
@@ -1189,7 +1412,7 @@ private fun ScannerPreviewCard(
                                             }
                                         }
                                     },
-                                    onScanned = { result -> scanGate.submit(result, ::isActive) }
+                                    onScanned = { result -> scanGate.submit(result, isActive = ::isActive) }
                                 )
                                 analyzer = ownedAnalyzer
                                 ownedAnalysis.setAnalyzer(ownedExecutor, ownedAnalyzer)
@@ -1255,7 +1478,7 @@ private fun ScannerPreviewCard(
                 detachCallback = { runtime.setScannerGunApiCallback(null) }
                 runtime.attachScannerGunApi(context) { code ->
                     scanGate.submit(code) {
-                        active.get() && lifecycleOwner.lifecycle.currentState != Lifecycle.State.DESTROYED
+                        active.get() && lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
                     }
                 }
             }
@@ -1356,9 +1579,9 @@ private fun ScannerPreviewCard(
                         brush = Brush.horizontalGradient(
                             colors = listOf(
                                 Color.Transparent,
-                                Color(0xFFFF2B2B).copy(alpha = scanLineAlpha * 0.55f),
-                                Color(0xFFFFF1F1).copy(alpha = scanLineAlpha),
-                                Color(0xFFFF2B2B).copy(alpha = scanLineAlpha * 0.55f),
+                                Color(0xFFFF2B2B).copy(alpha = scanLineAlpha.value * 0.55f),
+                                Color(0xFFFFF1F1).copy(alpha = scanLineAlpha.value),
+                                Color(0xFFFF2B2B).copy(alpha = scanLineAlpha.value * 0.55f),
                                 Color.Transparent
                             ),
                             startX = scanLineStart,
