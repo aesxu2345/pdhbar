@@ -1,7 +1,6 @@
 package com.pdyy.pdhbar.scanner
 
 import android.annotation.SuppressLint
-import android.os.SystemClock
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -16,7 +15,6 @@ class MLKitBarcodeAnalyzer(
     private val scanner = BarcodeScanning.getClient()
     private val scannerLock = Any()
     private val closed = AtomicBoolean(false)
-    private val frameThrottle = FrameThrottle()
 
     @SuppressLint("UnsafeOptInUsageError")
     override fun analyze(imageProxy: ImageProxy) {
@@ -24,7 +22,7 @@ class MLKitBarcodeAnalyzer(
         frame.protect {
             // Serialize process() with close(), including fromMediaImage failures.
             synchronized(scannerLock) {
-                if (closed.get() || !frameThrottle.accept(SystemClock.elapsedRealtime())) {
+                if (closed.get()) {
                     frame.close()
                     return@protect
                 }

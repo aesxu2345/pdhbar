@@ -38,7 +38,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.URI
+import java.net.URL
 import java.net.URLEncoder
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicLong
@@ -245,11 +251,7 @@ class ScannerGunApiBridge {
     private var callback: ((String) -> Unit)? = null
     private var receiverRegistered = false
     private var serviceBound = false
-    @Volatile
     private var scanInterface: SunmiScanInterface? = null
-    private val serviceCommands = ScannerCommandDispatcher()
-    // Accessed only by the serial service worker. Reconnect gets a new identity.
-    private var configuredService: SunmiScanInterface? = null
     private var activeRuntime: std? = null
     private var configured = false
     private var lastTriggerAt = 0L
@@ -258,13 +260,9 @@ class ScannerGunApiBridge {
     private var keyBufferFlush: Runnable? = null
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, service: IBinder) {
-            val scanner = SunmiScanInterface(service)
-            scanInterface = scanner
+            scanInterface = SunmiScanInterface(service)
             Log.d(RUNTIME_TAG, "scanner gun sunmi service connected name=$name")
-            serviceCommands.submit(
-                action = { if (scanInterface === scanner) configureSunmiServiceCommand(scanner) },
-                onFailure = { Log.w(RUNTIME_TAG, "scanner service configuration failed: ${it.javaClass.simpleName}") }
-            )
+            configureSunmiServiceCommand()
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -314,15 +312,21 @@ class ScannerGunApiBridge {
         mainHandler.postDelayed({ sendSunmiBroadcastOutputSetting(context, 2) }, 1_500L)
     }
 
-    private fun configureSunmiServiceCommand(scanner: SunmiScanInterface) {
-        if (configuredService === scanner) return
+    private fun configureSunmiServiceCommand() {
+        val scanner = scanInterface ?: return
         val commands = listOf(
             "sunmi007001=1;scan00000101=1;sunmi007003=50;scan00000102=50;",
             "sunmi003002=1;",
             "sunmi003001=1;sunmi003006=$SUNMI_SCANNER_RESULT_ACTION;sunmi003007=$SUNMI_SCANNER_RESULT_DATA_KEY;sunmi003008=$SUNMI_SCANNER_RESULT_BYTE_KEY;"
         )
-        commands.forEach(scanner::sendCommand)
-        configuredService = scanner
+        commands.forEach { command ->
+            runCatching {
+                scanner.sendCommand(command)
+                Log.d(RUNTIME_TAG, "scanner gun sunmi service command sent command=$command")
+            }.onFailure {
+                Log.w(RUNTIME_TAG, "scanner gun sunmi service command failed command=$command: ${it.message ?: it.javaClass.simpleName}")
+            }
+        }
     }
 
     private fun sendSunmiSerialCommand(context: Context, command: String) {
@@ -357,18 +361,26 @@ class ScannerGunApiBridge {
     fun triggerScan() {
         val now = SystemClock.uptimeMillis()
         if (now - lastTriggerAt < 3_800L) return
-        val scanner = scanInterface ?: return
-        val submitted = serviceCommands.submit(
-            action = {
-                if (scanInterface === scanner) {
-                    configureSunmiServiceCommand(scanner)
+        lastTriggerAt = now
+        runCatching {
+            val scanner = scanInterface
+            if (scanner == null) {
+                Log.d(RUNTIME_TAG, "scanner gun sunmi service not connected, waiting for hardware scan")
+                return
+            }
+            configureSunmiServiceCommand()
+            mainHandler.postDelayed({
+                runCatching {
                     scanner.scan()
+                    Log.d(RUNTIME_TAG, "scanner gun sunmi service scan requested")
+                    mainHandler.postDelayed({ runCatching { scanner.stop() } }, 50L)
+                }.onFailure {
+                    Log.w(RUNTIME_TAG, "scanner gun sunmi service scan failed: ${it.message ?: it.javaClass.simpleName}")
                 }
-            },
-            afterDelay = { if (scanInterface === scanner) scanner.stop() },
-            onFailure = { Log.w(RUNTIME_TAG, "scanner service operation failed: ${it.javaClass.simpleName}") }
-        )
-        if (submitted) lastTriggerAt = now
+            }, 100L)
+        }.onFailure {
+            Log.w(RUNTIME_TAG, "scanner gun sunmi trigger failed: ${it.message ?: it.javaClass.simpleName}")
+        }
     }
 
     private fun sendSunmiBroadcastOutputSetting(context: Context, attempt: Int) {
@@ -866,34 +878,33 @@ class Postman(
             .toString()
         Log.i(
             RUNTIME_TAG,
-            "range POST request method=POST " +
+            "range POST request url=${rangeTarget.url()} method=POST " +
                 "contentType=application/json; charset=utf-8"
         )
+        logCompletePayload(RUNTIME_TAG, "range POST request body", body)
         val response = withContext(Dispatchers.IO) {
             executeRawHttp11Post(rangeTarget, body)
         }
         Log.i(
             RUNTIME_TAG,
-            "range POST response http=${response.statusCode} bodyLength=${response.body.length}"
+            "range POST response startUtc=$startUtcSeconds endUtc=$endUtcSeconds " +
+                "http=${response.statusCode} bodyLength=${response.body.length}"
         )
+        logCompletePayload(RUNTIME_TAG, "range POST response body", response.body)
         require(response.statusCode in 200..299) { "HTTP ${response.statusCode}" }
-        // The ticker logs propagated exceptions; JSON exceptions/free-form server messages
-        // may contain the entire response or personal data, so do not attach them as causes.
-        val root = try {
-            JSONObject(response.body)
-        } catch (_: org.json.JSONException) {
-            throw IllegalArgumentException("Invalid range response JSON")
-        }
+        val root = JSONObject(response.body)
+        val responseMessage = root.optString("msg").takeIf(String::isNotBlank)
+            ?: root.optString("message").takeIf(String::isNotBlank)
         Log.i(
             RUNTIME_TAG,
-            "range POST decoded code=${root.optInt("code", Int.MIN_VALUE)} " +
-                "status=${root.optBoolean("status", false)}"
+            "range POST decoded code=${root.opt("code")} status=${root.opt("status")} " +
+                "msg=${root.optString("msg")} message=${root.optString("message")}"
         )
         require(root.optInt("code", Int.MIN_VALUE) == 200) {
-            "range query failed"
+            responseMessage ?: "range query failed"
         }
         require(root.optBoolean("status", false)) {
-            "range query status is false"
+            responseMessage ?: "range query status is false"
         }
         val records = root.optJSONArray("data")
             ?: throw IllegalArgumentException("missing data")
@@ -931,11 +942,7 @@ class Postman(
             for (attempt in 0..uploadTarget.retry.coerceAtLeast(0)) {
                 try {
                     val response = executeRawHttp11Post(uploadTarget, body)
-                    val responseJson = try {
-                        JSONObject(response.body)
-                    } catch (_: org.json.JSONException) {
-                        null
-                    }
+                    val responseJson = runCatching { JSONObject(response.body) }.getOrNull()
                     val businessCode = responseJson
                         ?.takeIf { it.has("code") && !it.isNull("code") }
                         ?.optInt("code")
@@ -954,7 +961,7 @@ class Postman(
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
-                } catch (error: Exception) {
+                } catch (error: Throwable) {
                     lastResult = WaitGroupExecutionResult(
                         completed = false,
                         message = error.message ?: error.javaClass.simpleName
@@ -1034,7 +1041,6 @@ class GetXwwwAction(
         var lastMessage: String? = null
 
         while (attempt < 5 && !ok) {
-            coroutineContext.ensureActive()
             ok = try {
                 executeHttp("GET", requestUrl, target, null, ::setMessage) { terminal ->
                     completed = terminal
@@ -1049,7 +1055,7 @@ class GetXwwwAction(
 
             if (!ok) {
                 lastMessage = msg ?: lastMessage ?: "GET failed"
-                Log.w(RUNTIME_TAG, "get attempt failed ${attempt + 1}/5 terminal=$completed")
+                Log.w(RUNTIME_TAG, "get attempt failed ${attempt + 1}/5: $lastMessage")
                 if (completed) return@withContext false
                 attempt += 1
                 if (attempt < 5) {
@@ -1070,7 +1076,7 @@ class PostJsonAction(
     private val source: String = "direct"
 ) : OncePostmanAction() {
     private val requestId = requestSequence.incrementAndGet()
-    private val trace get() = "requestId=$requestId"
+    private val trace get() = "requestId=$requestId source=$source"
 
     private companion object {
         val requestSequence = AtomicLong()
@@ -1091,7 +1097,7 @@ class PostJsonAction(
                 try {
                     Log.i(
                         RUNTIME_TAG,
-                        "post request $trace attempt=${attempt + 1}/${maxRetry + 1} " +
+                        "post request $trace url=${target.url()} attempt=${attempt + 1}/${maxRetry + 1} " +
                             "method=POST contentType=application/json; charset=utf-8"
                     )
                     Log.d(RUNTIME_TAG, "post request $trace bodyLength=${body.length}")
@@ -1099,14 +1105,10 @@ class PostJsonAction(
                     responseText = response.body
                     Log.i(
                         RUNTIME_TAG,
-                        "post response $trace attempt=${attempt + 1}/${maxRetry + 1} " +
+                        "post response $trace url=${target.url()} attempt=${attempt + 1}/${maxRetry + 1} " +
                             "http=${response.statusCode} bodyLength=${response.body.length}"
                     )
-                    val responseJson = try {
-                        JSONObject(response.body)
-                    } catch (_: org.json.JSONException) {
-                        null
-                    }
+                    val responseJson = runCatching { JSONObject(response.body) }.getOrNull()
                     val businessCode = responseJson
                         ?.takeIf { it.has("code") && !it.isNull("code") }
                         ?.optInt("code")
@@ -1124,7 +1126,7 @@ class PostJsonAction(
 
                     lastMessage = responseMessage ?: "HTTP ${response.statusCode}"
                     setMessage(lastMessage)
-                    Log.w(RUNTIME_TAG, "post attempt failed $trace ${attempt + 1}/${maxRetry + 1} terminal=$completed")
+                    Log.w(RUNTIME_TAG, "post attempt failed $trace ${attempt + 1}/${maxRetry + 1}: $lastMessage terminal=$completed")
                     if (completed) {
                         return@withContext false
                     }
@@ -1134,7 +1136,7 @@ class PostJsonAction(
                     lastError = e
                     lastMessage = e.message ?: e.javaClass.simpleName
                     setMessage(lastMessage)
-                    Log.w(RUNTIME_TAG, "post attempt error $trace ${attempt + 1}/${maxRetry + 1} type=${e.javaClass.simpleName}")
+                    Log.w(RUNTIME_TAG, "post attempt error $trace ${attempt + 1}/${maxRetry + 1}: $lastMessage", e)
                 }
 
                 attempt += 1
@@ -1838,6 +1840,11 @@ class SystemIOBoundService : Service() {
     }
 }
 
+private data class RawHttpResponse(
+    val statusCode: Int,
+    val body: String
+)
+
 private data class BreakfastRightView(
     val orderCode: String,
     val cardNo: String?,
@@ -1921,7 +1928,7 @@ private fun BreakfastRightView.blockReason(): String? {
     return reason?.takeIf(String::isNotBlank) ?: "后台未提供具体理由"
 }
 
-private suspend fun executeHttp(
+private fun executeHttp(
     method: String,
     requestUrl: String,
     target: NetTarget,
@@ -1929,30 +1936,88 @@ private suspend fun executeHttp(
     setMessage: (String?) -> Unit,
     setCompleted: (Boolean) -> Unit = {}
 ): Boolean {
-    val response = executeBoundedUrlRequest(
-        method, requestUrl, target.headers, body, target.connectTimeoutMs, target.readTimeoutMs
-    )
-    val httpOk = response.statusCode in 200..299
-    val businessCode = Regex("\\\"code\\\"\\s*:\\s*(\\d+)").find(response.body)
-        ?.groupValues
-        ?.getOrNull(1)
-        ?.toIntOrNull()
-    val responseMessage = Regex("\\\"msg\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"").find(response.body)
-        ?.groupValues
-        ?.getOrNull(1)
+    val connection = (URL(requestUrl).openConnection() as HttpURLConnection).apply {
+        requestMethod = method
+        connectTimeout = target.connectTimeoutMs.toInt()
+        readTimeout = target.readTimeoutMs.toInt()
+        target.headers.forEach { (key, value) -> setRequestProperty(key, value) }
+        if (body != null) {
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+    }
 
-    val ok = httpOk && (businessCode == null || businessCode == 200)
-    setCompleted(isTerminalHttpOutcome(response.statusCode, businessCode))
-    if (!ok) setMessage(responseMessage ?: "HTTP ${response.statusCode}")
-    return ok
+    return try {
+        if (body != null) {
+            OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { writer ->
+                writer.write(body)
+            }
+        }
+
+        val httpOk = connection.responseCode in 200..299
+        val responseText = readResponse(connection, httpOk)
+        val businessCode = Regex("\\\"code\\\"\\s*:\\s*(\\d+)").find(responseText)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+        val responseMessage = Regex("\\\"msg\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"").find(responseText)
+            ?.groupValues
+            ?.getOrNull(1)
+
+        val ok = httpOk && (businessCode == null || businessCode == 200)
+        setCompleted(isTerminalHttpOutcome(connection.responseCode, businessCode))
+        if (!ok) setMessage(responseMessage ?: "HTTP ${connection.responseCode}")
+        ok
+    } finally {
+        connection.disconnect()
+    }
 }
 
-private suspend fun executeRawHttp11Post(target: NetTarget, body: String): HttpWireResponse {
+private fun readResponse(connection: HttpURLConnection, httpOk: Boolean): String {
+    val stream = if (httpOk) connection.inputStream else connection.errorStream
+    return stream?.bufferedReader(Charsets.UTF_8)?.use(BufferedReader::readText).orEmpty()
+}
+
+private const val LOGCAT_PAYLOAD_CHUNK_SIZE = 3_000
+
+/** Logs every character without relying on Logcat's per-entry truncation limit. */
+private fun logCompletePayload(tag: String, label: String, payload: String) {
+    if (payload.isEmpty()) {
+        Log.i(tag, "$label [empty]")
+        return
+    }
+    val chunkCount = (payload.length + LOGCAT_PAYLOAD_CHUNK_SIZE - 1) /
+        LOGCAT_PAYLOAD_CHUNK_SIZE
+    payload.chunked(LOGCAT_PAYLOAD_CHUNK_SIZE).forEachIndexed { index, chunk ->
+        Log.i(tag, "$label [${index + 1}/$chunkCount] $chunk")
+    }
+}
+
+private fun executeRawHttp11Post(target: NetTarget, body: String): RawHttpResponse {
     require(target.scheme == "http") { "raw socket only supports http" }
-    return executeBoundedRawHttp11Post(
-        target.host, target.port, target.path, target.headers, body,
-        target.connectTimeoutMs, target.readTimeoutMs
-    )
+    val cleanPath = if (target.path.startsWith("/")) target.path else "/${target.path}"
+    val bodyBytes = body.toByteArray(Charsets.UTF_8)
+
+    Socket().use { socket ->
+        socket.connect(InetSocketAddress(target.host, target.port), target.connectTimeoutMs.toInt())
+        socket.soTimeout = target.readTimeoutMs.toInt()
+        val outputStream = socket.getOutputStream()
+        val writer = outputStream.bufferedWriter(Charsets.ISO_8859_1)
+        writer.append("POST $cleanPath HTTP/1.1\r\n")
+        writer.append("Host: ${target.host}:${target.port}\r\n")
+        writer.append("Content-Type: application/json; charset=utf-8\r\n")
+        writer.append("Accept: application/json\r\n")
+        writer.append("Connection: close\r\n")
+        target.headers.forEach { (key, value) -> writer.append("$key: $value\r\n") }
+        writer.append("Content-Length: ${bodyBytes.size}\r\n")
+        writer.append("\r\n")
+        writer.flush()
+        outputStream.write(bodyBytes)
+        outputStream.flush()
+
+        val response = readBoundedHttpResponse(socket.getInputStream())
+        return RawHttpResponse(statusCode = response.statusCode, body = response.body)
+    }
 }
 
 private fun parseBreakfastRight(json: String): BreakfastRightView? {

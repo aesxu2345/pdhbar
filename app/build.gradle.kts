@@ -38,8 +38,7 @@ android {
     }
 
     defaultConfig {
-        // Separate installation and data directory; keep the Kotlin/R namespace unchanged.
-        applicationId = "com.pdyy.pdhbar2"
+        applicationId = "com.pdyy.pdhbar"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
@@ -87,8 +86,6 @@ dependencies {
     implementation(libs.google.mlkit.barcode.scanning)
     implementation(libs.coil.compose)
     implementation(libs.coil.network.okhttp)
-    // Direct use for cancellable status requests; also used transitively by Coil.
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // UIKit AAR and its checksum are distributed together under /uikit.
     implementation("org.mozilla.geckoview:geckoview:152.0.20260713164047")
     implementation(files(rootProject.file("uikit/UIKitInsight-release.aar")))

@@ -12,7 +12,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.time.Instant
 import java.time.LocalDate
@@ -39,9 +38,7 @@ class HourlyOrderTicker(
     configuredMinWorkers: Int? = DEFAULT_INDEXED_BOUNDED_MIN_WORKERS
 ) {
     private val applicationContext = context.applicationContext
-    private val tickerScope = CoroutineScope(
-        SupervisorJob() + Dispatchers.IO + HttpTransportLane.Background
-    )
+    private val tickerScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val tickerNetTarget = initialTickerNetTarget.copy(retry = TICKER_NETWORK_RETRY_COUNT)
     private val tickerPostman = Postman(tickerNetTarget)
     private val immediateRangeRequests = Channel<Unit>(Channel.CONFLATED)
@@ -58,12 +55,7 @@ class HourlyOrderTicker(
         context = applicationContext,
         configuredMinWorkers = configuredMinWorkers,
         waitGroup = tickerWaitGroup,
-        // Engines own independent scopes: inherit only the lane, never the ticker's Job.
-        query = { orderCode ->
-            withContext(checkNotNull(tickerScope.coroutineContext[HttpTransportLane])) {
-                tickerPostman.queryBreakfastRightForTicker(orderCode)
-            }
-        },
+        query = tickerPostman::queryBreakfastRightForTicker,
         onObserved = ::onIgnoredPoolObserved
     )
 
@@ -129,7 +121,7 @@ class HourlyOrderTicker(
                 )
             } catch (cancelled: CancellationException) {
                 throw cancelled
-            } catch (error: Exception) {
+            } catch (error: Throwable) {
                 Log.w(HOURLY_ORDER_TICKER_TAG, "hourly order range query ignored", error)
                 notifyOperator("预缓存刷新失败：${error.message ?: "网络或响应异常"}")
             }
