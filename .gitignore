@@ -10,6 +10,9 @@
 /.idea/navEditor.xml
 /.idea/assetWizardSettings.xml
 .DS_Store
+__MACOSX/
+MAC_OSX/
+._*
 /build
 /captures
 .externalNativeBuild
