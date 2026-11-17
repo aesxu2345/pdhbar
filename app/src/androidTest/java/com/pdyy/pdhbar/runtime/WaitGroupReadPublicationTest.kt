@@ -12,6 +12,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
@@ -34,6 +35,47 @@ import java.util.concurrent.atomic.AtomicInteger
 /** Real Android JSON/Context with isolated in-memory preferences and deterministic disk gates. */
 @RunWith(AndroidJUnit4::class)
 class WaitGroupReadPublicationTest {
+    @Test
+    fun falseProbeAdvancesToStateOneAndExecutesEnrollment() = runBlocking {
+        val requests = java.util.concurrent.CopyOnWriteArrayList<WaitGroupRequest>()
+        val queue = WaitGroup(TestContext(), executor = { request ->
+            requests += request
+            if (request.task == WaitGroupTask.QueryBreakfastRight) {
+                WaitGroupExecutionResult(true, true,
+                    """{"data":{"order_code":"test-order","allow_breakfast":false}}""")
+            } else {
+                WaitGroupExecutionResult(true, true)
+            }
+        }, agedUnregisteredExecutor = { WaitGroupExecutionResult(completed = false) })
+        try {
+            val finished = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000L) { queue.onwaitgroup.first() }
+            }
+            assertTrue(queue.push("test-order", ApprovalQueueAction.ApproveBreakfast))
+            queue.enroll()
+            val output = finished.await()
+            assertEquals(listOf(WaitGroupTask.QueryBreakfastRight, WaitGroupTask.Enroll),
+                requests.map { it.task })
+            assertEquals(WaitApprovalState.Approved, requests.last().approvalState)
+            assertEquals(WaitGroupOutcome.Completed, output.outcome)
+            assertEquals(false, output.cacheNode?.allowBreakfast)
+            assertEquals(0, queue.len())
+        } finally {
+            queue.shutdown()
+        }
+    }
+
+    @Test
+    fun approvalParserAcceptsFalseButNotMissingOrNullEntitlement() {
+        for (value in listOf("false", "true", "0", "\"false\"")) {
+            assertEquals(WaitApprovalState.Approved,
+                parseApprovalState("""{"data":{"allow_breakfast":$value}}"""))
+        }
+        assertNull(parseApprovalState("""{"data":{}}"""))
+        assertNull(parseApprovalState("""{"data":{"allow_breakfast":null}}"""))
+        assertNull(parseApprovalState("""{"data":{"allow_breakfast":"unknown"}}"""))
+    }
+
     @Test
     fun unrestoredBufferReadMissesWithoutOpeningPreferences() = runBlocking {
         val context = TestContext()

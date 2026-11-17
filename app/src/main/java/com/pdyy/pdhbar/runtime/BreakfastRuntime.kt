@@ -1344,7 +1344,7 @@ sealed interface UiCommand {
         val organizationName: String?,
         val examTotalPrice: String?,
         val hasBreakfast: Boolean,
-        val allowBreakfast: Boolean,
+        val allowBreakfast: Boolean?,
         val blockReason: String?,
         val querying: Boolean = false,
         val preCached: Boolean = false,
@@ -1696,9 +1696,7 @@ class PipeFall(context: Context) : PipeFallIO() {
                 target.push(
                     orderCode = orderCode,
                     action = action,
-                    approvalState = cacheNode?.allowBreakfast?.let {
-                        if (it) WaitApprovalState.Approved else WaitApprovalState.Blocked
-                    } ?: WaitApprovalState.Pending,
+                    approvalState = cacheNode?.allowBreakfast.toApprovalState(),
                     cacheNode = cacheNode,
                     ignoredSourceNodeId = ignoredSourceNodeId
                 )
@@ -1751,17 +1749,17 @@ class PipeFall(context: Context) : PipeFallIO() {
             ?: output.result.responseText?.let(::parseBreakfastRight)
         val name = customer?.name?.takeIf { it.isNotBlank() && it != "未知客户" }
         val person = name?.let { "（$it）" }.orEmpty()
-        val blocked = customer?.allowBreakfast == false ||
+        val blocked = output.request.approvalState == WaitApprovalState.Blocked ||
             output.result.message?.contains("无早餐权益") == true
         val title: String
         val text: String
-        if (blocked) {
+        if (output.outcome == WaitGroupOutcome.Completed && output.result.success) {
+            title = "早餐登记成功"
+            text = "导检单号 ${output.request.orderCode}$person 已成功登记早餐"
+        } else if (blocked) {
             title = "早餐审批：无早餐权益"
             val reason = customer?.reason?.takeIf(String::isNotBlank) ?: "后端未提供具体理由"
             text = "导检单号 ${output.request.orderCode}$person：$reason"
-        } else if (output.outcome == WaitGroupOutcome.Completed && output.result.success) {
-            title = "早餐登记成功"
-            text = "导检单号 ${output.request.orderCode}$person 已成功登记早餐"
         } else {
             return
         }
@@ -1851,7 +1849,7 @@ private data class BreakfastRightView(
     val organizationName: String?,
     val examTotalPrice: String?,
     val hasBreakfast: Boolean,
-    val allowBreakfast: Boolean,
+    val allowBreakfast: Boolean?,
     val reason: String?
 )
 
@@ -1870,7 +1868,7 @@ private fun BreakfastRightCacheNode.toBreakfastRightView(): BreakfastRightView =
         Regex("\\d+(?:\\.\\d{1,2})?").matches(it)
     },
     hasBreakfast = hasBreakfast ?: false,
-    allowBreakfast = allowBreakfast ?: false,
+    allowBreakfast = allowBreakfast,
     reason = reasonB64.decodeBase64()
 )
 
@@ -1917,7 +1915,7 @@ private fun postApprovalNotification(context: Context, key: String, title: Strin
 }
 
 private fun BreakfastRightView.blockReason(): String? {
-    if (allowBreakfast) return null
+    if (allowBreakfast == true) return null
     return reason?.takeIf(String::isNotBlank) ?: "后台未提供具体理由"
 }
 
@@ -1974,7 +1972,7 @@ private fun parseBreakfastRight(json: String): BreakfastRightView? {
         organizationName = organizationName,
         examTotalPrice = examTotalPrice,
         hasBreakfast = json.booleanField("has_breakfast") ?: false,
-        allowBreakfast = json.booleanField("allow_breakfast") ?: false,
+        allowBreakfast = json.booleanField("allow_breakfast"),
         reason = json.base64Field("reason_b64")
     )
 }

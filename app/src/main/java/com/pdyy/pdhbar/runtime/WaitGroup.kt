@@ -1441,10 +1441,12 @@ private fun JSONObject.optNullableBoolean(name: String): Boolean? =
 private fun JSONObject.optNullableInt(name: String): Int? =
     if (!has(name) || isNull(name)) null else (opt(name) as? Number)?.toInt()
 
-private fun Boolean.toApprovalState(): WaitApprovalState =
-    if (this) WaitApprovalState.Approved else WaitApprovalState.Blocked
+// A known false result is an operator warning, not a state-0 execution veto.
+// Keep the original nullable entitlement in the cache for the dialog warning.
+internal fun Boolean?.toApprovalState(): WaitApprovalState =
+    if (this == null) WaitApprovalState.Pending else WaitApprovalState.Approved
 
-private fun parseApprovalState(responseText: String): WaitApprovalState? {
+internal fun parseApprovalState(responseText: String): WaitApprovalState? {
     val allowBreakfast = runCatching {
         val root = JSONObject(responseText)
         val payload = root.optJSONObject("data") ?: root
@@ -1472,11 +1474,7 @@ private fun parseApprovalState(responseText: String): WaitApprovalState? {
         ?.firstOrNull { it.isNotEmpty() }
         ?.lowercase()
         ?.let { it == "true" || it == "1" }
-    return when (allowBreakfast) {
-        true -> WaitApprovalState.Approved
-        false -> WaitApprovalState.Blocked
-        null -> null
-    }
+    return allowBreakfast?.toApprovalState()
 }
 
 private fun String.sha256(): String = MessageDigest.getInstance("SHA-256")

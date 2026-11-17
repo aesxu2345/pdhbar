@@ -2059,19 +2059,31 @@ private fun AppExitConfirmDialog(
 }
 
 @Composable
-private fun CustomerDialog(
+internal fun CustomerDialog(
     customer: UiCommand.ShowCustomer,
     onDone: () -> Unit,
     onCancelBreakfast: () -> Unit,
     onDismiss: () -> Unit
 ) {
-    var backgroundApprovalAvailable by remember(customer.orderCode, customer.querying) {
+    var backgroundApprovalAvailable by remember(customer.queryId, customer.orderCode, customer.querying) {
         mutableStateOf(false)
     }
-    LaunchedEffect(customer.orderCode, customer.querying) {
+    LaunchedEffect(customer.queryId, customer.orderCode, customer.querying) {
         if (customer.querying) {
             delay(3_000L)
             backgroundApprovalAvailable = true
+        }
+    }
+    val entitlementWarning = !customer.querying && customer.allowBreakfast == false
+    var warningSecondsRemaining by remember(customer.queryId, customer.orderCode, entitlementWarning) {
+        mutableStateOf(3)
+    }
+    LaunchedEffect(customer.queryId, customer.orderCode, entitlementWarning) {
+        if (entitlementWarning) {
+            while (warningSecondsRemaining > 0) {
+                delay(1_000L)
+                warningSecondsRemaining -= 1
+            }
         }
     }
     AlertDialog(
@@ -2110,7 +2122,14 @@ private fun CustomerDialog(
                     querying = customer.querying
                 )
                 Text("早餐状态：${if (customer.querying) "N/A 查询中" else if (customer.hasBreakfast) "已登记" else "未登记"}")
-                Text("权益状态：${if (customer.querying) "N/A 查询中" else if (customer.allowBreakfast) "允许" else "不允许"}")
+                Text("权益状态：${if (customer.querying) "N/A 查询中" else when (customer.allowBreakfast) { true -> "允许"; false -> "不允许"; null -> "未知" }}")
+                if (entitlementWarning) {
+                    Text(
+                        text = "此人无早餐权益，是否仍要继续？",
+                        color = Color(0xFFD32F2F),
+                        fontWeight = FontWeight.Bold
+                    )
+                }
                 customer.blockReason?.let { reason ->
                     Text(
                         text = "原因：$reason",
@@ -2134,17 +2153,31 @@ private fun CustomerDialog(
                 enabled = if (customer.querying) {
                     backgroundApprovalAvailable
                 } else {
-                    customer.allowBreakfast
+                    customer.allowBreakfast == true ||
+                        (entitlementWarning && warningSecondsRemaining == 0)
                 },
                 onClick = onDone,
-                colors = DialogButtonColors
+                colors = if (entitlementWarning) ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFFD32F2F),
+                    contentColor = Color.White,
+                    disabledContainerColor = Color(0xFFE0E0E0),
+                    disabledContentColor = Color(0xFF616161)
+                ) else DialogButtonColors
             ) {
-                Text(if (customer.querying) "后台审批" else "完成早餐")
+                Text(
+                    when {
+                        customer.querying -> "后台审批"
+                        entitlementWarning && warningSecondsRemaining > 0 ->
+                            "完成早餐（${warningSecondsRemaining}s）"
+                        else -> "完成早餐"
+                    }
+                )
             }
         },
         dismissButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (customer.querying || customer.allowBreakfast) {
+                // Both known entitlement values use the same cancellation action.
+                if (customer.querying || customer.allowBreakfast != null) {
                     TextButton(
                         enabled = true,
                         onClick = onCancelBreakfast,
